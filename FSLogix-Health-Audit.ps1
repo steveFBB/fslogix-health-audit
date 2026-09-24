@@ -3788,20 +3788,116 @@ if ($FSLogixInstalled) {
         }
         else {
 
-            $ProfileEvidence = (
+            # ------------------------------------------------
+            # Identify profiles backed by an attached FSLogix
+            # container (Status 0 or 300 with Reason 0) so they
+            # are not reported as true local profiles.
+            # ------------------------------------------------
+
+            $AttachedContainerSids = @()
+
+            $ProfileSessionRoot =
+                "HKLM:\SOFTWARE\FSLogix\Profiles\Sessions"
+
+            if (Test-Path $ProfileSessionRoot) {
+
+                $ProfileSessionKeys = @(
+                    Get-ChildItem `
+                        -Path $ProfileSessionRoot `
+                        -ErrorAction SilentlyContinue
+                )
+
+                foreach ($ProfileSessionKey in $ProfileSessionKeys) {
+
+                    $ProfileSession =
+                        Get-ItemProperty `
+                            -Path $ProfileSessionKey.PSPath `
+                            -ErrorAction SilentlyContinue
+
+                    if (
+                        $null -eq $ProfileSession -or
+                        $null -eq $ProfileSession.Status
+                    ) {
+                        continue
+                    }
+
+                    $ProfileSessionReason =
+                        if ($null -ne $ProfileSession.Reason) {
+                            [int]$ProfileSession.Reason
+                        }
+                        else {
+                            0
+                        }
+
+                    if (
+                        ([int]$ProfileSession.Status -in @(0,300)) -and
+                        $ProfileSessionReason -eq 0
+                    ) {
+
+                        $AttachedContainerSids +=
+                            $ProfileSessionKey.PSChildName
+                    }
+                }
+            }
+
+            $FSLogixBackedProfiles = @(
                 $LocalProfiles |
+                Where-Object {
+                    $AttachedContainerSids -contains $_.SID
+                }
+            )
+
+            $TrueLocalProfiles = @(
+                $LocalProfiles |
+                Where-Object {
+                    $AttachedContainerSids -notcontains $_.SID
+                }
+            )
+
+            $FSLogixBackedEvidence = (
+                $FSLogixBackedProfiles |
                 ForEach-Object {
                     "$($_.LocalPath) [Loaded=$($_.Loaded)]"
                 }
             ) -join "; "
 
-            Add-HealthResult `
-                -Status "INFO" `
-                -Category "Runtime" `
-                -Check "Local profile inventory" `
-                -Finding "$($LocalProfiles.Count) non-special local profile(s) are present." `
-                -Evidence $ProfileEvidence `
-                -Recommendation "Review only if an unexpected user is using a local profile instead of an FSLogix container."
+            if ($TrueLocalProfiles.Count -eq 0) {
+
+                $Evidence =
+                    "FSLogix container attached: $FSLogixBackedEvidence"
+
+                Add-HealthResult `
+                    -Status "PASS" `
+                    -Category "Runtime" `
+                    -Check "Local profile inventory" `
+                    -Finding "No local Windows profiles were found outside attached FSLogix containers." `
+                    -Evidence $Evidence
+            }
+            else {
+
+                $ProfileEvidence = (
+                    $TrueLocalProfiles |
+                    ForEach-Object {
+                        "$($_.LocalPath) [Loaded=$($_.Loaded)]"
+                    }
+                ) -join "; "
+
+                $Evidence = "Local: $ProfileEvidence"
+
+                if ($FSLogixBackedProfiles.Count -gt 0) {
+
+                    $Evidence +=
+                        "; FSLogix container attached: $FSLogixBackedEvidence"
+                }
+
+                Add-HealthResult `
+                    -Status "INFO" `
+                    -Category "Runtime" `
+                    -Check "Local profile inventory" `
+                    -Finding "$($TrueLocalProfiles.Count) non-special local profile(s) are present that are not backed by an attached FSLogix container." `
+                    -Evidence $Evidence `
+                    -Recommendation "Review only if an unexpected user is using a local profile instead of an FSLogix container."
+            }
         }
     }
     catch {
