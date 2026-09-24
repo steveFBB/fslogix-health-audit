@@ -13,7 +13,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "0.9.3"
+$ScriptVersion = "0.9.4"
 
 # ------------------------------------------------------------
 # Execution metadata
@@ -4123,57 +4123,149 @@ $HtmlFile =
         $ReportPath `
         "FSLogix-Health-Audit-$ComputerName-$Timestamp.html"
 
-$HtmlRows =
-    foreach ($Result in $Results) {
+# ------------------------------------------------------------
+# Category section colours
+# ------------------------------------------------------------
 
-        switch ($Result.Status) {
+$CategoryColours = @{
+    "Host"          = "#455a64"
+    "Domain"        = "#3949ab"
+    "Install"       = "#00796b"
+    "Services"      = "#01579b"
+    "Configuration" = "#7b1fa2"
+    "Drivers"       = "#6d4c41"
+    "Groups"        = "#c2185b"
+    "Storage"       = "#00838f"
+    "Antivirus"     = "#bf360c"
+    "Runtime"       = "#827717"
+}
 
-            "PASS" {
-                $StatusClass = "pass"
+$DefaultCategoryColour = "#607d8b"
+
+# Preserve the order in which categories were first reported.
+$CategoryOrder = @(
+    $Results |
+    ForEach-Object {
+        $_.Category
+    } |
+    Select-Object -Unique
+)
+
+$HtmlSections =
+    foreach ($CategoryName in $CategoryOrder) {
+
+        $CategoryResults = @(
+            $Results |
+            Where-Object {
+                $_.Category -eq $CategoryName
+            }
+        )
+
+        $CategoryColour =
+            if ($CategoryColours.ContainsKey($CategoryName)) {
+                $CategoryColours[$CategoryName]
+            }
+            else {
+                $DefaultCategoryColour
             }
 
-            "WARN" {
-                $StatusClass = "warn"
+        # Per-section status counts, most severe first.
+        $CategoryBadges =
+            foreach ($BadgeStatus in @("FAIL","WARN","PASS","INFO")) {
+
+                $BadgeCount = @(
+                    $CategoryResults |
+                    Where-Object Status -eq $BadgeStatus
+                ).Count
+
+                if ($BadgeCount -gt 0) {
+
+                    "<span class=""badge $($BadgeStatus.ToLowerInvariant())"">$BadgeCount $BadgeStatus</span>"
+                }
             }
 
-            "FAIL" {
-                $StatusClass = "fail"
-            }
+        $CategoryRows =
+            foreach ($Result in $CategoryResults) {
 
-            default {
-                $StatusClass = "info"
-            }
-        }
+                switch ($Result.Status) {
 
-        $SafeCategory =
-            ConvertTo-HtmlSafe $Result.Category
+                    "PASS" {
+                        $StatusClass = "pass"
+                    }
 
-        $SafeStatus =
-            ConvertTo-HtmlSafe $Result.Status
+                    "WARN" {
+                        $StatusClass = "warn"
+                    }
 
-        $SafeCheck =
-            ConvertTo-HtmlSafe $Result.Check
+                    "FAIL" {
+                        $StatusClass = "fail"
+                    }
 
-        $SafeFinding =
-            ConvertTo-HtmlSafe $Result.Finding
+                    default {
+                        $StatusClass = "info"
+                    }
+                }
 
-        $SafeEvidence =
-            ConvertTo-HtmlSafe $Result.Evidence
+                $SafeStatus =
+                    ConvertTo-HtmlSafe $Result.Status
 
-        $SafeRecommendation =
-            ConvertTo-HtmlSafe $Result.Recommendation
+                $SafeCheck =
+                    ConvertTo-HtmlSafe $Result.Check
+
+                $SafeFinding =
+                    ConvertTo-HtmlSafe $Result.Finding
+
+                $SafeEvidence =
+                    ConvertTo-HtmlSafe $Result.Evidence
+
+                $SafeRecommendation =
+                    ConvertTo-HtmlSafe $Result.Recommendation
 
 @"
-<tr class="$StatusClass">
-    <td>$SafeCategory</td>
-    <td><strong>$SafeStatus</strong></td>
+<tr class="row-$StatusClass">
+    <td><span class="badge $StatusClass">$SafeStatus</span></td>
     <td>$SafeCheck</td>
     <td>$SafeFinding</td>
     <td>$SafeEvidence</td>
     <td>$SafeRecommendation</td>
 </tr>
 "@
+            }
+
+        $SafeCategoryName =
+            ConvertTo-HtmlSafe $CategoryName
+
+@"
+<section class="category" style="--cat: $CategoryColour;">
+
+<div class="category-header">
+    <h2>$SafeCategoryName</h2>
+    <div class="category-counts">$($CategoryBadges -join " ")</div>
+</div>
+
+<table>
+
+<tr>
+    <th class="col-status">Status</th>
+    <th class="col-check">Check</th>
+    <th class="col-finding">Finding</th>
+    <th>Evidence</th>
+    <th class="col-rec">Recommendation</th>
+</tr>
+
+$($CategoryRows -join "`n")
+
+</table>
+
+</section>
+"@
     }
+
+# Dim summary boxes with a zero count so non-zero results stand out.
+$PassZeroClass = if ($PassCount -eq 0) { " zero" } else { "" }
+$WarnZeroClass = if ($WarnCount -eq 0) { " zero" } else { "" }
+$FailZeroClass = if ($FailCount -eq 0) { " zero" } else { "" }
+$InfoZeroClass = if ($InfoCount -eq 0) { " zero" } else { "" }
 
 $SafeComputerName =
     ConvertTo-HtmlSafe $ComputerName
@@ -4208,6 +4300,22 @@ $Html = @"
 
 <style>
 
+:root {
+    --pass: #2e7d32;
+    --warn: #a15c00;
+    --fail: #c62828;
+    --info: #546e7a;
+
+    --pass-tint: #e8f5e9;
+    --warn-tint: #fff8e1;
+    --fail-tint: #fdecea;
+}
+
+* {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+}
+
 body {
     font-family: Segoe UI, Arial, sans-serif;
     margin: 30px;
@@ -4225,80 +4333,146 @@ h1 {
     line-height: 1.5;
 }
 
-.parameters {
-    background: white;
-    border: 1px solid #ddd;
-    border-radius: 6px;
-    padding: 12px 16px;
-    margin-bottom: 20px;
-    line-height: 1.5;
-}
-
-.parameters strong {
-    display: inline-block;
-    min-width: 210px;
-}
+/* ------------------------------------------------------------
+   Summary boxes
+   ------------------------------------------------------------ */
 
 .summary {
     display: flex;
+    flex-wrap: wrap;
     gap: 12px;
-    margin-bottom: 20px;
+    margin-bottom: 24px;
 }
 
 .summary-box {
-    background: white;
-    border: 1px solid #ddd;
     border-radius: 6px;
-    padding: 10px 18px;
-    min-width: 80px;
+    border: 2px solid var(--status);
+    padding: 12px 22px;
+    min-width: 90px;
     text-align: center;
+    color: white;
+    background: var(--status);
 }
 
+.summary-box.pass { --status: var(--pass); }
+.summary-box.warn { --status: var(--warn); }
+.summary-box.fail { --status: var(--fail); }
+.summary-box.info { --status: var(--info); }
+
 .summary-number {
-    font-size: 24px;
+    font-size: 26px;
     font-weight: 700;
 }
 
 .summary-label {
     font-size: 12px;
-    color: #666;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* ------------------------------------------------------------
+   Category sections
+   ------------------------------------------------------------ */
+
+.category {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    overflow: hidden;
+}
+
+.category-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    background: var(--cat);
+    color: white;
+    padding: 10px 14px;
+}
+
+.category-header h2 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+}
+
+.category-header .badge {
+    border: 1px solid rgba(255, 255, 255, 0.7);
 }
 
 table {
     width: 100%;
     border-collapse: collapse;
-    background: white;
+    table-layout: fixed;
 }
 
 th {
-    background: #333;
-    color: white;
+    background: #f0f0f0;
+    color: #333;
     text-align: left;
-    padding: 10px;
+    padding: 8px 10px;
+    font-size: 13px;
+    border-bottom: 2px solid var(--cat);
 }
 
 td {
-    padding: 10px;
-    border-bottom: 1px solid #ddd;
+    padding: 8px 10px;
+    border-bottom: 1px solid #eee;
     vertical-align: top;
     word-break: break-word;
+    font-size: 13px;
 }
 
-.pass {
-    border-left: 5px solid #2e7d32;
+.col-status {
+    width: 70px;
 }
 
-.warn {
-    border-left: 5px solid #b8860b;
+.col-check {
+    width: 17%;
 }
 
-.fail {
-    border-left: 5px solid #c62828;
+.col-finding {
+    width: 22%;
 }
 
-.info {
-    border-left: 5px solid #607d8b;
+.col-rec {
+    width: 22%;
 }
+
+/* ------------------------------------------------------------
+   Result rows
+   ------------------------------------------------------------ */
+
+tr.row-pass td:first-child { border-left: 5px solid var(--pass); }
+tr.row-warn td:first-child { border-left: 5px solid var(--warn); }
+tr.row-fail td:first-child { border-left: 5px solid var(--fail); }
+tr.row-info td:first-child { border-left: 5px solid var(--info); }
+
+tr.row-warn { background: var(--warn-tint); }
+tr.row-fail { background: var(--fail-tint); }
+
+/* ------------------------------------------------------------
+   Status badges
+   ------------------------------------------------------------ */
+
+.badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    color: white;
+    white-space: nowrap;
+}
+
+.badge.pass { background: var(--pass); }
+.badge.warn { background: var(--warn); }
+.badge.fail { background: var(--fail); }
+.badge.info { background: var(--info); }
 
 </style>
 
@@ -4314,58 +4488,31 @@ Generated: $SafeGenerated<br>
 Audit version: $SafeVersion
 </div>
 
-<div class="parameters">
-
-<strong>Execution identity:</strong> $SafeRunAsIdentity<br>
-<strong>Elevated:</strong> $IsElevated<br>
-<strong>PowerShell:</strong> $SafePSVersion ($SafePSEdition)<br>
-<strong>Event lookback:</strong> $EventLookbackDays days<br>
-<strong>Container warning threshold:</strong> $ContainerWarningPercent%<br>
-<strong>Maximum container files:</strong> $MaxContainerFiles<br>
-<strong>Non-interactive:</strong> $([bool]$NonInteractive)<br>
-<strong>Report path:</strong> $SafeReportPath<br>
-<strong>Audit exit code:</strong> $AuditExitCode
-
-</div>
-
 <div class="summary">
 
-<div class="summary-box">
+<div class="summary-box pass$PassZeroClass">
     <div class="summary-number">$PassCount</div>
     <div class="summary-label">PASS</div>
 </div>
 
-<div class="summary-box">
+<div class="summary-box warn$WarnZeroClass">
     <div class="summary-number">$WarnCount</div>
     <div class="summary-label">WARN</div>
 </div>
 
-<div class="summary-box">
+<div class="summary-box fail$FailZeroClass">
     <div class="summary-number">$FailCount</div>
     <div class="summary-label">FAIL</div>
 </div>
 
-<div class="summary-box">
+<div class="summary-box info$InfoZeroClass">
     <div class="summary-number">$InfoCount</div>
     <div class="summary-label">INFO</div>
 </div>
 
 </div>
 
-<table>
-
-<tr>
-    <th>Category</th>
-    <th>Status</th>
-    <th>Check</th>
-    <th>Finding</th>
-    <th>Evidence</th>
-    <th>Recommendation</th>
-</tr>
-
-$($HtmlRows -join "`n")
-
-</table>
+$($HtmlSections -join "`n")
 
 </body>
 
