@@ -1,105 +1,167 @@
-
-
 ````markdown
 # FSLogix Health Audit
 
-PowerShell health audit for FSLogix profile container environments.
+PowerShell health audit for FSLogix Profile Container environments.
 
-The script performs a read-only assessment of FSLogix configuration, storage connectivity, antivirus exclusions, services, profile state, event logs, and common configuration issues. It is intended for Windows and Azure Virtual Desktop environments.
+The script performs a read-only assessment of FSLogix configuration, storage connectivity, antivirus exclusions, runtime state, profile health, and common configuration issues. It is intended for Windows and Azure Virtual Desktop environments.
 
-## Checks
+## Features
 
-The audit currently validates:
+The audit currently checks:
 
+- Windows version and device join state
 - FSLogix installation and version
+- FSLogix service state
 - Profile Container configuration
-- VHD/VHDX settings
-- Storage reachability and write access
-- Azure Files / Kerberos configuration
-- Microsoft Defender exclusions
-- FSLogix services and drivers
-- Include/exclude groups
-- Profile attach state
-- Temporary and orphaned profiles
-- Local profiles
+- VHD Locations
+- DeleteLocalProfileWhenVHDShouldApply
+- PreventLoginWithFailure
+- PreventLoginWithTempProfile
+- SMB connectivity to the configured profile share
+- Profile share reachability
+- Microsoft Defender active state
+- FSLogix Defender exclusions
 - FSLogix event log errors
-- Host and AVD state
+- Current FSLogix session status
+- Temporary and orphaned profiles
+- Local profile inventory
+- FSLogix text logging
 
-## Output
+## Defender Exclusion Validation
 
-The script generates:
+The Defender exclusion checks are designed to validate effective coverage rather than perform simple string matching.
 
-- HTML health report
-- JSON results for automation and further analysis
+The script accounts for:
 
-Example:
+- Environment variables such as `%ProgramFiles%` and `%ProgramData%`
+- Wildcard user paths
+- Parent folder exclusions covering child files
+- Process exclusions
+- VHD and VHDX extension exclusions
+- Explicit VHD/VHDX share patterns
+- `.lock`, `.meta`, and `.metadata` files
+- Profile container shares defined in `VHDLocations`
+
+If Microsoft Defender is not the active real-time antivirus engine, incomplete Defender exclusions are reported as informational rather than as a failure.
+
+## Event Log Analysis
+
+FSLogix event log errors from the previous 7 days are grouped by cause rather than Event ID alone.
+
+For example, Event ID 26 messages are separated into:
+
+- Known-folder redirection access denied
+- Domain lookup failures
+- Expected Entra-only LDAP conditions
+- Other Event ID 26 errors
+
+This helps avoid grouping unrelated causes into a single warning.
+
+The event lookback period can be changed with:
 
 ```powershell
-.\FSLogix-Health-Audit.ps1 -ReportPath C:\Temp
+.\FSLogix-Health-Audit.ps1 -EventLookbackDays 14
 ````
 
 ## Status Levels
 
-* **PASS** - configuration or health check passed
-* **WARN** - configuration should be reviewed
-* **FAIL** - actionable issue requiring investigation
-* **INFO** - informational result or configuration detail
+* **PASS** - the check completed successfully and the expected configuration or state was found
+* **WARN** - a condition was detected that should be reviewed
+* **FAIL** - an actionable configuration or health problem was detected
+* **INFO** - informational result, skipped check, or condition requiring manual interpretation
+
+## Output
+
+The script generates both HTML and JSON reports.
+
+Default output location:
+
+```text
+C:\Temp
+```
+
+Example filenames:
+
+```text
+FSLogix-Health-Audit-HOSTNAME-20260924-165838.html
+FSLogix-Health-Audit-HOSTNAME-20260924-165838.json
+```
+
+## Usage
+
+Run PowerShell as administrator and execute:
+
+```powershell
+.\FSLogix-Health-Audit.ps1
+```
+
+Specify a different report location:
+
+```powershell
+.\FSLogix-Health-Audit.ps1 -ReportPath C:\Reports
+```
+
+Specify a different event log lookback period:
+
+```powershell
+.\FSLogix-Health-Audit.ps1 -EventLookbackDays 14
+```
+
+Use both options:
+
+```powershell
+.\FSLogix-Health-Audit.ps1 -ReportPath C:\Reports -EventLookbackDays 14
+```
+
+## Requirements
+
+* Windows PowerShell
+* Administrative PowerShell session recommended
+* FSLogix installed on the target system for FSLogix-specific checks
+* Network access to the configured profile storage location
+* Microsoft Defender PowerShell cmdlets for Defender exclusion validation
 
 ## Design Goals
 
 * Read-only operation
 * No configuration changes
 * Minimise false positives
-* Validate effective configuration rather than only registry defaults
-* Handle environment variables and wildcard exclusions correctly
+* Validate effective configuration rather than literal registry or exclusion strings
 * Distinguish recommendations from genuine faults
-* Produce consistent results suitable for individual hosts or estate-wide auditing
+* Handle third-party antivirus scenarios gracefully
+* Produce readable HTML output
+* Produce structured JSON output for automation and further analysis
 
-## Scope
+## Scope and Limitations
 
-The script assesses the session host from which it is executed.
+The audit assesses the system on which it is executed.
 
-Some configuration cannot be fully validated from the session host alone, including:
+Some conditions cannot be fully validated from a single session host, including:
 
-* storage-side antivirus configuration
-* user-specific Azure Files permissions
-* backend storage performance
-* configuration on other session hosts
+* Antivirus exclusions configured only in a third-party management console
+* Backend storage performance
+* Storage-side antivirus configuration
+* User permissions that differ from the identity running the audit
+* Conditions on other session hosts in the same pool
 
-## Requirements
+Local Windows profiles are reported as informational because administrative or service profiles may legitimately exist on a session host.
 
-* Windows PowerShell 5.1 or PowerShell 7
-* Administrative PowerShell session recommended
-* FSLogix installed on the target system
+Historical event log warnings remain visible until they fall outside the configured event lookback period.
 
-## Getting Started
+## Safety
 
-Clone the repository:
+The script is read-only.
 
-```powershell
-git clone https://github.com/steveFBB/fslogix-health-audit.git
-cd fslogix-health-audit
-```
+It does not:
 
-Run the audit:
+* Modify FSLogix configuration
+* Modify registry values
+* Change antivirus exclusions
+* Modify profile containers
+* Delete local profiles
+* Change storage permissions
+* Restart services
 
-```powershell
-.\FSLogix-Health-Audit.ps1 -ReportPath C:\Temp
-```
-
-## Development
-
-This project is being developed to improve the accuracy of FSLogix health assessment, particularly around effective Defender exclusions, profile configuration, Azure Files authentication, and event-log analysis.
-
-## Disclaimer
-
-Review findings before making configuration changes. A warning or failure should be validated against the environment and current Microsoft documentation.
+Review all findings before making configuration changes.
 
 ```
-
-That gives us a solid initial README without pretending the script already has functionality we haven't built yet.
-
-As we change the script, we should update the README at the same time rather than leaving documentation until the end. Your AVD repo already follows that kind of practical operational-documentation style. :contentReference[oaicite:1]{index=1}
-```
-
-[1]: https://github.com/steveFBB/avd-landing-zone "GitHub - steveFBB/avd-landing-zone · GitHub"
