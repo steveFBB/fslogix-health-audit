@@ -8,7 +8,7 @@ It does not make configuration changes, delete profiles, restart services, mount
 
 ## Current Version
 
-`0.9.3`
+`0.9.4`
 
 ## What the Audit Checks
 
@@ -486,13 +486,23 @@ The HTML report contains:
 - evidence
 - recommendations
 
+### HTML report layout
+
+The HTML report is colour-coded so issues can be found at a glance:
+
+- Summary boxes show the PASS, WARN, FAIL and INFO totals in solid status colours (green, amber, red and grey).
+- Results are grouped into sections by category (Host, Domain, Install, Services, Configuration, Drivers, Groups, Storage, Antivirus, Runtime), each with its own coloured header.
+- Each section header shows that section's status counts, so problem areas stand out without reading every row.
+- Each result has a coloured status badge and a coloured left edge; WARN and FAIL rows are also tinted.
+- Colours are chosen for readable white text and are preserved when the report is printed or saved to PDF.
+
 The JSON report contains the same core result data in a structured format suitable for automation or later processing.
 
 Example JSON structure:
 
 ```json
 {
-  "ScriptVersion": "0.9.3",
+  "ScriptVersion": "0.9.4",
   "ComputerName": "HOST01",
   "Generated": "2026-09-24 19:08:17",
   "ExecutionContext": {
@@ -582,4 +592,4 @@ Review the evidence and recommendation for each finding rather than treating the
 
 ## Project Status
 
-Version `0.9.3` is a pre-release. The next planned milestone is `1.0.0`.
+Version `0.9.4` is a pre-release. The next planned milestone is `1.0.0`.
