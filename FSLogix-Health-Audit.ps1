@@ -1,9 +1,14 @@
 param (
     [string]$ReportPath = "C:\Temp",
-    [int]$EventLookbackDays = 7
+    [int]$EventLookbackDays = 7,
+    [ValidateRange(1,100)]
+    [int]$ContainerWarningPercent = 90,
+    [ValidateRange(1,10000)]
+    [int]$MaxContainerFiles = 1000
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptVersion = "0.9.0"
 
 # ------------------------------------------------------------
 # Startup confirmation
@@ -15,6 +20,7 @@ Write-Host ""
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "             FSLogix Health Audit             " -ForegroundColor Cyan
 Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host "Version $ScriptVersion"
 Write-Host ""
 Write-Host "This script performs a read-only health audit of the local FSLogix environment."
 Write-Host ""
@@ -22,13 +28,16 @@ Write-Host "The audit may query:"
 Write-Host " - Local registry settings"
 Write-Host " - FSLogix services and drivers"
 Write-Host " - Local FSLogix groups"
-Write-Host " - Profile storage connectivity"
+Write-Host " - Profile storage connectivity and capacity"
+Write-Host " - FSLogix profile container file sizes"
 Write-Host " - Microsoft Defender configuration"
 Write-Host " - FSLogix event logs and text logs"
 Write-Host " - Current FSLogix session/profile state"
+Write-Host " - Active Directory and DNS connectivity"
+Write-Host " - Azure Files capacity if Azure PowerShell is already authenticated"
 Write-Host ""
 Write-Host "No configuration changes, profile deletions, service restarts,"
-Write-Host "or storage modifications are performed."
+Write-Host "storage modifications, container mounts, or Azure sign-in actions are performed."
 Write-Host ""
 
 $Choice = Read-Host "Do you want to run the audit? [R] Run  [Q] Quit"
@@ -64,6 +73,7 @@ if (-not (Test-Path $ReportPath)) {
 
 $ComputerName = $env:COMPUTERNAME
 $Timestamp    = Get-Date -Format "yyyyMMdd-HHmmss"
+$Generated    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 $Results = New-Object System.Collections.Generic.List[object]
 
@@ -92,6 +102,21 @@ function Add-HealthResult {
         Evidence       = $Evidence
         Recommendation = $Recommendation
     })
+}
+
+function ConvertTo-HtmlSafe {
+    param (
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return [System.Net.WebUtility]::HtmlEncode(
+        [string]$Value
+    )
 }
 
 function Normalize-PathString {
@@ -309,6 +334,115 @@ function Test-EveryoneMembership {
     return $false
 }
 
+function Get-EffectiveProfileSetting {
+    param (
+        [Parameter(Mandatory)]
+        [object]$ProfileConfig,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        $DefaultValue
+    )
+
+    $Property = $ProfileConfig.PSObject.Properties[$Name]
+
+    if ($null -ne $Property) {
+
+        return [PSCustomObject]@{
+            Value      = $Property.Value
+            Configured = $true
+        }
+    }
+
+    return [PSCustomObject]@{
+        Value      = $DefaultValue
+        Configured = $false
+    }
+}
+
+function Get-ContainerFiles {
+    param (
+        [Parameter(Mandatory)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory)]
+        [int]$MaximumFiles
+    )
+
+    $FoundFiles   = @()
+    $LimitReached = $false
+
+    try {
+
+        $RootFiles = @(
+            Get-ChildItem `
+                -LiteralPath $RootPath `
+                -File `
+                -ErrorAction Stop |
+            Where-Object {
+                $_.Extension -match '^\.(vhd|vhdx)$'
+            }
+        )
+
+        foreach ($File in $RootFiles) {
+
+            $FoundFiles += $File
+
+            if ($FoundFiles.Count -ge $MaximumFiles) {
+                $LimitReached = $true
+                break
+            }
+        }
+
+        if (-not $LimitReached) {
+
+            $Directories = @(
+                Get-ChildItem `
+                    -LiteralPath $RootPath `
+                    -Directory `
+                    -ErrorAction Stop
+            )
+
+            foreach ($Directory in $Directories) {
+
+                $DirectoryFiles = @(
+                    Get-ChildItem `
+                        -LiteralPath $Directory.FullName `
+                        -File `
+                        -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Extension -match '^\.(vhd|vhdx)$'
+                    }
+                )
+
+                foreach ($File in $DirectoryFiles) {
+
+                    $FoundFiles += $File
+
+                    if ($FoundFiles.Count -ge $MaximumFiles) {
+                        $LimitReached = $true
+                        break
+                    }
+                }
+
+                if ($LimitReached) {
+                    break
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Files        = $FoundFiles
+            LimitReached = $LimitReached
+        }
+    }
+    catch {
+        throw
+    }
+}
+
 function Get-FSLogixEventClassification {
     param (
         [Parameter(Mandatory)]
@@ -389,6 +523,7 @@ function Get-FSLogixEventClassification {
 
 $DomainJoined  = $false
 $AzureAdJoined = $false
+$DomainName    = $null
 
 try {
 
@@ -414,7 +549,9 @@ catch {
 try {
 
     $ComputerSystem = Get-CimInstance Win32_ComputerSystem
+
     $DomainJoined = [bool]$ComputerSystem.PartOfDomain
+    $DomainName   = $ComputerSystem.Domain
 
     $DsRegOutput = dsregcmd /status 2>$null
 
@@ -449,7 +586,7 @@ try {
         -Category "Host" `
         -Check "Device join state" `
         -Finding $JoinDescription `
-        -Evidence "DomainJoined=$DomainJoined; AzureAdJoined=$AzureAdJoined"
+        -Evidence "DomainJoined=$DomainJoined; AzureAdJoined=$AzureAdJoined; Domain=$DomainName"
 }
 catch {
 
@@ -459,6 +596,174 @@ catch {
         -Check "Device join state" `
         -Finding "Unable to determine complete device join state." `
         -Evidence $_.Exception.Message
+}
+
+# ------------------------------------------------------------
+# Current Active Directory / domain health
+# ------------------------------------------------------------
+
+if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
+
+    try {
+
+        $SecureChannel = Test-ComputerSecureChannel -ErrorAction Stop
+
+        if ($SecureChannel) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Domain" `
+                -Check "Computer secure channel" `
+                -Finding "The computer secure channel to Active Directory is healthy." `
+                -Evidence "Test-ComputerSecureChannel = True"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "FAIL" `
+                -Category "Domain" `
+                -Check "Computer secure channel" `
+                -Finding "The computer secure channel to Active Directory is not healthy." `
+                -Evidence "Test-ComputerSecureChannel = False" `
+                -Recommendation "Investigate the computer account, domain connectivity and secure channel before relying on FSLogix domain-based authentication."
+        }
+    }
+    catch {
+
+        Add-HealthResult `
+            -Status "WARN" `
+            -Category "Domain" `
+            -Check "Computer secure channel" `
+            -Finding "Unable to verify the computer secure channel." `
+            -Evidence $_.Exception.Message
+    }
+
+    try {
+
+        $NltestOutput = @(
+            & nltest.exe "/dsgetdc:$DomainName" 2>&1
+        )
+
+        $NltestExitCode = $LASTEXITCODE
+
+        if ($NltestExitCode -eq 0) {
+
+            $DcName = $null
+
+            foreach ($Line in $NltestOutput) {
+
+                if ($Line -match '^\s*DC:\s*\\\\(.+?)\s*$') {
+                    $DcName = $Matches[1].Trim()
+                    break
+                }
+            }
+
+            $Evidence = if ($DcName) {
+                "Discovered DC: $DcName"
+            }
+            else {
+                ($NltestOutput -join " ")
+            }
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Domain" `
+                -Check "Domain controller discovery" `
+                -Finding "A domain controller can be discovered for $DomainName." `
+                -Evidence $Evidence
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "FAIL" `
+                -Category "Domain" `
+                -Check "Domain controller discovery" `
+                -Finding "A domain controller could not be discovered for $DomainName." `
+                -Evidence ($NltestOutput -join " ") `
+                -Recommendation "Check DNS, routing, firewall rules and domain controller availability."
+        }
+    }
+    catch {
+
+        Add-HealthResult `
+            -Status "WARN" `
+            -Category "Domain" `
+            -Check "Domain controller discovery" `
+            -Finding "Unable to perform domain controller discovery." `
+            -Evidence $_.Exception.Message
+    }
+
+    try {
+
+        $ResolveDnsNameCommand = Get-Command Resolve-DnsName `
+            -ErrorAction SilentlyContinue
+
+        if ($ResolveDnsNameCommand) {
+
+            $SrvName = "_ldap._tcp.dc._msdcs.$DomainName"
+
+            $SrvRecords = @(
+                Resolve-DnsName `
+                    -Name $SrvName `
+                    -Type SRV `
+                    -ErrorAction Stop |
+                Where-Object {
+                    $_.Type -eq "SRV"
+                }
+            )
+
+            if ($SrvRecords.Count -gt 0) {
+
+                $SrvTargets = (
+                    $SrvRecords |
+                    Select-Object -ExpandProperty NameTarget -Unique
+                ) -join "; "
+
+                Add-HealthResult `
+                    -Status "PASS" `
+                    -Category "Domain" `
+                    -Check "Active Directory DNS SRV records" `
+                    -Finding "Active Directory domain controller SRV records resolve successfully." `
+                    -Evidence "$SrvName -> $SrvTargets"
+            }
+            else {
+
+                Add-HealthResult `
+                    -Status "FAIL" `
+                    -Category "Domain" `
+                    -Check "Active Directory DNS SRV records" `
+                    -Finding "No domain controller SRV records were returned." `
+                    -Evidence $SrvName `
+                    -Recommendation "Review the DNS configuration used by the session host."
+            }
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "INFO" `
+                -Category "Domain" `
+                -Check "Active Directory DNS SRV records" `
+                -Finding "Resolve-DnsName is unavailable, so the SRV record check was skipped."
+        }
+    }
+    catch {
+
+        Add-HealthResult `
+            -Status "FAIL" `
+            -Category "Domain" `
+            -Check "Active Directory DNS SRV records" `
+            -Finding "Active Directory domain controller SRV records could not be resolved." `
+            -Evidence $_.Exception.Message `
+            -Recommendation "Review the DNS servers and DNS suffix configuration used by the session host."
+    }
+}
+else {
+
+    Add-HealthResult `
+        -Status "INFO" `
+        -Category "Domain" `
+        -Check "Active Directory health" `
+        -Finding "Domain health checks were skipped because this device is not domain joined."
 }
 
 # ------------------------------------------------------------
@@ -559,9 +864,10 @@ else {
 # FSLogix Profile Container configuration
 # ------------------------------------------------------------
 
-$ProfilesRegPath = "HKLM:\SOFTWARE\FSLogix\Profiles"
-$ProfileConfig   = $null
-$VHDLocations    = @()
+$ProfilesRegPath    = "HKLM:\SOFTWARE\FSLogix\Profiles"
+$ProfileConfig      = $null
+$VHDLocations       = @()
+$EffectiveSizeInMBs = 30000
 
 if (Test-Path $ProfilesRegPath) {
 
@@ -671,6 +977,201 @@ if (Test-Path $ProfilesRegPath) {
                 -Finding "PreventLoginWithTempProfile is not enabled." `
                 -Evidence "Current value: $($ProfileConfig.PreventLoginWithTempProfile)" `
                 -Recommendation "Review whether temporary-profile sign-ins should be blocked."
+        }
+
+        # ----------------------------------------------------
+        # Recommended configuration baseline
+        # ----------------------------------------------------
+
+        $LockedRetryCount = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "LockedRetryCount" `
+            -DefaultValue 12
+
+        if ([int]$LockedRetryCount.Value -eq 3) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "LockedRetryCount" `
+                -Finding "LockedRetryCount matches Microsoft's recommended value." `
+                -Evidence "Effective value: 3; Configured=$($LockedRetryCount.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "WARN" `
+                -Category "Configuration" `
+                -Check "LockedRetryCount" `
+                -Finding "LockedRetryCount does not match Microsoft's recommended value of 3." `
+                -Evidence "Effective value: $($LockedRetryCount.Value); Configured=$($LockedRetryCount.Configured)" `
+                -Recommendation "Review whether LockedRetryCount should be set to 3 to provide a faster failure response when a container is locked."
+        }
+
+        $LockedRetryInterval = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "LockedRetryInterval" `
+            -DefaultValue 5
+
+        if ([int]$LockedRetryInterval.Value -eq 15) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "LockedRetryInterval" `
+                -Finding "LockedRetryInterval matches Microsoft's recommended value." `
+                -Evidence "Effective value: 15 seconds; Configured=$($LockedRetryInterval.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "WARN" `
+                -Category "Configuration" `
+                -Check "LockedRetryInterval" `
+                -Finding "LockedRetryInterval does not match Microsoft's recommended value of 15 seconds." `
+                -Evidence "Effective value: $($LockedRetryInterval.Value) seconds; Configured=$($LockedRetryInterval.Configured)" `
+                -Recommendation "Review whether LockedRetryInterval should be set to 15."
+        }
+
+        $ReAttachRetryCount = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "ReAttachRetryCount" `
+            -DefaultValue 60
+
+        if ([int]$ReAttachRetryCount.Value -eq 3) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "ReAttachRetryCount" `
+                -Finding "ReAttachRetryCount matches Microsoft's recommended value." `
+                -Evidence "Effective value: 3; Configured=$($ReAttachRetryCount.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "WARN" `
+                -Category "Configuration" `
+                -Check "ReAttachRetryCount" `
+                -Finding "ReAttachRetryCount does not match Microsoft's recommended value of 3." `
+                -Evidence "Effective value: $($ReAttachRetryCount.Value); Configured=$($ReAttachRetryCount.Configured)" `
+                -Recommendation "Review whether ReAttachRetryCount should be set to 3 to provide a faster failure response after an unexpected container disconnect."
+        }
+
+        $ReAttachIntervalSeconds = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "ReAttachIntervalSeconds" `
+            -DefaultValue 10
+
+        if ([int]$ReAttachIntervalSeconds.Value -eq 15) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "ReAttachIntervalSeconds" `
+                -Finding "ReAttachIntervalSeconds matches Microsoft's recommended value." `
+                -Evidence "Effective value: 15 seconds; Configured=$($ReAttachIntervalSeconds.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "WARN" `
+                -Category "Configuration" `
+                -Check "ReAttachIntervalSeconds" `
+                -Finding "ReAttachIntervalSeconds does not match Microsoft's recommended value of 15 seconds." `
+                -Evidence "Effective value: $($ReAttachIntervalSeconds.Value) seconds; Configured=$($ReAttachIntervalSeconds.Configured)" `
+                -Recommendation "Review whether ReAttachIntervalSeconds should be set to 15."
+        }
+
+        $ProfileType = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "ProfileType" `
+            -DefaultValue 0
+
+        if ([int]$ProfileType.Value -eq 0) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "ProfileType" `
+                -Finding "ProfileType is configured for standard single-connection profile behaviour." `
+                -Evidence "Effective value: 0; Configured=$($ProfileType.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "INFO" `
+                -Category "Configuration" `
+                -Check "ProfileType" `
+                -Finding "ProfileType is configured for concurrent profile behaviour." `
+                -Evidence "Effective value: $($ProfileType.Value); Configured=$($ProfileType.Configured)" `
+                -Recommendation "Confirm that concurrent profile access is intentional and consistently configured across all hosts."
+        }
+
+        $SizeInMBs = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "SizeInMBs" `
+            -DefaultValue 30000
+
+        $EffectiveSizeInMBs = [double]$SizeInMBs.Value
+
+        Add-HealthResult `
+            -Status "INFO" `
+            -Category "Configuration" `
+            -Check "Profile container maximum size" `
+            -Finding "The effective profile container maximum size is $($SizeInMBs.Value) MB." `
+            -Evidence "SizeInMBs=$($SizeInMBs.Value); Configured=$($SizeInMBs.Configured)"
+
+        $VolumeType = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "VolumeType" `
+            -DefaultValue "vhd"
+
+        if (
+            ([string]$VolumeType.Value).Trim().ToLowerInvariant() -eq "vhdx"
+        ) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "Volume type" `
+                -Finding "New profile containers are configured to use VHDX." `
+                -Evidence "Effective value: $($VolumeType.Value); Configured=$($VolumeType.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "WARN" `
+                -Category "Configuration" `
+                -Check "Volume type" `
+                -Finding "New profile containers use VHD rather than Microsoft's recommended VHDX format." `
+                -Evidence "Effective value: $($VolumeType.Value); Configured=$($VolumeType.Configured)" `
+                -Recommendation "VHDX is preferred for new containers. Changing this setting does not convert existing VHD containers."
+        }
+
+        $FlipFlopProfileDirectoryName = Get-EffectiveProfileSetting `
+            -ProfileConfig $ProfileConfig `
+            -Name "FlipFlopProfileDirectoryName" `
+            -DefaultValue 0
+
+        if ([int]$FlipFlopProfileDirectoryName.Value -eq 1) {
+
+            Add-HealthResult `
+                -Status "PASS" `
+                -Category "Configuration" `
+                -Check "Profile directory naming" `
+                -Finding "FlipFlopProfileDirectoryName is enabled." `
+                -Evidence "Effective value: 1; Configured=$($FlipFlopProfileDirectoryName.Configured)"
+        }
+        else {
+
+            Add-HealthResult `
+                -Status "INFO" `
+                -Category "Configuration" `
+                -Check "Profile directory naming" `
+                -Finding "FlipFlopProfileDirectoryName is not enabled." `
+                -Evidence "Effective value: $($FlipFlopProfileDirectoryName.Value); Configured=$($FlipFlopProfileDirectoryName.Configured)" `
+                -Recommendation "Microsoft recommends this setting for easier container-folder browsing, but changing it in an existing environment can cause FSLogix to create new profile directories. Do not change it without planning the profile-folder migration."
         }
 
         # ----------------------------------------------------
@@ -855,42 +1356,56 @@ if ($FSLogixInstalled) {
             & fltmc.exe filters 2>&1
         )
 
-        $LoadedFilters = @()
+        $FltmcExitCode = $LASTEXITCODE
 
-        foreach ($Line in $FltmcOutput) {
+        if ($FltmcExitCode -ne 0) {
 
-            if ($Line -match '^\s*(frxdrv|frxdrvvt|frxccd)\s+') {
-                $LoadedFilters += $Matches[1].ToLowerInvariant()
-            }
+            Add-HealthResult `
+                -Status "INFO" `
+                -Category "Drivers" `
+                -Check "FSLogix minifilter state" `
+                -Finding "Unable to reliably query loaded minifilter drivers." `
+                -Evidence (($FltmcOutput | ForEach-Object { "$_" }) -join " ")
         }
+        else {
 
-        $LoadedFilters = @(
-            $LoadedFilters |
-            Select-Object -Unique
-        )
+            $LoadedFilters = @()
 
-        foreach ($RequiredFilter in @(
-            "frxdrv",
-            "frxdrvvt",
-            "frxccd"
-        )) {
+            foreach ($Line in $FltmcOutput) {
 
-            if ($LoadedFilters -contains $RequiredFilter) {
-
-                Add-HealthResult `
-                    -Status "PASS" `
-                    -Category "Drivers" `
-                    -Check "$RequiredFilter minifilter" `
-                    -Finding "$RequiredFilter is loaded."
+                if ($Line -match '^\s*(frxdrv|frxdrvvt|frxccd)\s+') {
+                    $LoadedFilters += $Matches[1].ToLowerInvariant()
+                }
             }
-            else {
 
-                Add-HealthResult `
-                    -Status "FAIL" `
-                    -Category "Drivers" `
-                    -Check "$RequiredFilter minifilter" `
-                    -Finding "$RequiredFilter is not currently loaded." `
-                    -Recommendation "Review the FSLogix installation and service/driver state."
+            $LoadedFilters = @(
+                $LoadedFilters |
+                Select-Object -Unique
+            )
+
+            foreach ($RequiredFilter in @(
+                "frxdrv",
+                "frxdrvvt",
+                "frxccd"
+            )) {
+
+                if ($LoadedFilters -contains $RequiredFilter) {
+
+                    Add-HealthResult `
+                        -Status "PASS" `
+                        -Category "Drivers" `
+                        -Check "$RequiredFilter minifilter" `
+                        -Finding "$RequiredFilter is loaded."
+                }
+                else {
+
+                    Add-HealthResult `
+                        -Status "FAIL" `
+                        -Category "Drivers" `
+                        -Check "$RequiredFilter minifilter" `
+                        -Finding "$RequiredFilter is not currently loaded." `
+                        -Recommendation "Review the FSLogix installation and service/driver state."
+                }
             }
         }
     }
@@ -947,7 +1462,8 @@ if ($FSLogixInstalled) {
 
                 try {
 
-                    $null = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+                    $Group = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+                    $null = $Group.Name
                     $GroupExists = $true
                 }
                 catch {
@@ -1097,7 +1613,7 @@ else {
 }
 
 # ------------------------------------------------------------
-# Storage checks
+# Storage connectivity and capacity
 # ------------------------------------------------------------
 
 if ($VHDLocations.Count -gt 0) {
@@ -1106,7 +1622,12 @@ if ($VHDLocations.Count -gt 0) {
 
         if ($Location -match '^\\\\([^\\]+)\\(.+)$') {
 
-            $StorageHost = $Matches[1]
+            $StorageHost     = $Matches[1]
+            $ShareAccessible = $false
+
+            # ------------------------------------------------
+            # TCP 445
+            # ------------------------------------------------
 
             try {
 
@@ -1145,9 +1666,15 @@ if ($VHDLocations.Count -gt 0) {
                     -Evidence $_.Exception.Message
             }
 
+            # ------------------------------------------------
+            # Share reachability
+            # ------------------------------------------------
+
             try {
 
                 if (Test-Path -Path $Location) {
+
+                    $ShareAccessible = $true
 
                     Add-HealthResult `
                         -Status "PASS" `
@@ -1175,6 +1702,462 @@ if ($VHDLocations.Count -gt 0) {
                     -Check "Profile share reachability" `
                     -Finding "Unable to test access to the configured FSLogix profile share." `
                     -Evidence "$Location - $($_.Exception.Message)"
+            }
+
+            # ------------------------------------------------
+            # Profile container file-size inventory
+            # ------------------------------------------------
+
+            if ($ShareAccessible -and $EffectiveSizeInMBs -gt 0) {
+
+                try {
+
+                    $ContainerScan = Get-ContainerFiles `
+                        -RootPath $Location `
+                        -MaximumFiles $MaxContainerFiles
+
+                    $ContainerFiles = @(
+                        $ContainerScan.Files
+                    )
+
+                    if ($ContainerFiles.Count -eq 0) {
+
+                        Add-HealthResult `
+                            -Status "INFO" `
+                            -Category "Storage" `
+                            -Check "Profile container sizes" `
+                            -Finding "No VHD or VHDX profile container files were found at the share root or one directory level below it." `
+                            -Evidence $Location
+                    }
+                    else {
+
+                        $MaximumBytes =
+                            [double]$EffectiveSizeInMBs * 1MB
+
+                        $ContainerDetails = @(
+                            $ContainerFiles |
+                            ForEach-Object {
+
+                                $SizeBytes = [double]$_.Length
+
+                                $PercentOfMaximum = [math]::Round(
+                                    (
+                                        $SizeBytes /
+                                        $MaximumBytes
+                                    ) * 100,
+                                    2
+                                )
+
+                                [PSCustomObject]@{
+                                    Name             = $_.Name
+                                    FullName         = $_.FullName
+                                    SizeBytes        = $SizeBytes
+                                    SizeGiB          = [math]::Round(
+                                        ($SizeBytes / 1GB),
+                                        2
+                                    )
+                                    PercentOfMaximum = $PercentOfMaximum
+                                    LastWriteTime    = $_.LastWriteTime
+                                }
+                            }
+                        )
+
+                        $ContainersNearLimit = @(
+                            $ContainerDetails |
+                            Where-Object {
+                                $_.PercentOfMaximum -ge
+                                $ContainerWarningPercent
+                            } |
+                            Sort-Object PercentOfMaximum -Descending
+                        )
+
+                        $LargestContainers = @(
+                            $ContainerDetails |
+                            Sort-Object SizeBytes -Descending |
+                            Select-Object -First 10
+                        )
+
+                        $TotalContainerBytes = (
+                            $ContainerDetails |
+                            Measure-Object `
+                                -Property SizeBytes `
+                                -Sum
+                        ).Sum
+
+                        if ($null -eq $TotalContainerBytes) {
+                            $TotalContainerBytes = 0
+                        }
+
+                        $TotalContainerGiB = [math]::Round(
+                            (
+                                [double]$TotalContainerBytes /
+                                1GB
+                            ),
+                            2
+                        )
+
+                        $LargestEvidence = (
+                            $LargestContainers |
+                            ForEach-Object {
+                                "$($_.Name)=$($_.SizeGiB) GiB ($($_.PercentOfMaximum)% of configured maximum)"
+                            }
+                        ) -join "; "
+
+                        $ScanSuffix = if ($ContainerScan.LimitReached) {
+                            " Scan stopped after $MaxContainerFiles container files because the configured audit limit was reached."
+                        }
+                        else {
+                            ""
+                        }
+
+                        if ($ContainersNearLimit.Count -gt 0) {
+
+                            $NearLimitEvidence = (
+                                $ContainersNearLimit |
+                                Select-Object -First 10 |
+                                ForEach-Object {
+                                    "$($_.FullName)=$($_.SizeGiB) GiB ($($_.PercentOfMaximum)%)"
+                                }
+                            ) -join "; "
+
+                            Add-HealthResult `
+                                -Status "WARN" `
+                                -Category "Storage" `
+                                -Check "Profile container sizes" `
+                                -Finding "$($ContainersNearLimit.Count) profile container file(s) are at or above the audit warning threshold of $ContainerWarningPercent% of SizeInMBs." `
+                                -Evidence "Configured maximum=$EffectiveSizeInMBs MB; Containers scanned=$($ContainerDetails.Count); Total container file size=$TotalContainerGiB GiB; Near threshold: $NearLimitEvidence.$ScanSuffix" `
+                                -Recommendation "Review the affected containers. Do not delete profile data or increase SizeInMBs without first determining why the container is large."
+                        }
+                        else {
+
+                            Add-HealthResult `
+                                -Status "PASS" `
+                                -Category "Storage" `
+                                -Check "Profile container sizes" `
+                                -Finding "No scanned profile container files are at or above the audit warning threshold of $ContainerWarningPercent% of SizeInMBs." `
+                                -Evidence "Configured maximum=$EffectiveSizeInMBs MB; Containers scanned=$($ContainerDetails.Count); Total container file size=$TotalContainerGiB GiB; Largest: $LargestEvidence.$ScanSuffix"
+                        }
+
+                        if ($ContainerScan.LimitReached) {
+
+                            Add-HealthResult `
+                                -Status "INFO" `
+                                -Category "Storage" `
+                                -Check "Profile container scan limit" `
+                                -Finding "The profile container inventory was limited to $MaxContainerFiles files." `
+                                -Evidence "The share contains at least $MaxContainerFiles VHD/VHDX files within the scanned layout." `
+                                -Recommendation "Increase -MaxContainerFiles if a larger inventory is required."
+                        }
+                    }
+                }
+                catch {
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Storage" `
+                        -Check "Profile container sizes" `
+                        -Finding "Unable to enumerate FSLogix profile container file sizes." `
+                        -Evidence $_.Exception.Message
+                }
+            }
+
+            # ------------------------------------------------
+            # Azure Files capacity
+            # ------------------------------------------------
+
+            if (
+                $Location -match
+                '^\\\\([^.\\]+)\.file\.core\.windows\.net\\([^\\]+)'
+            ) {
+
+                $AzureStorageAccountName = $Matches[1]
+                $AzureFileShareName      = $Matches[2]
+
+                $AzContextCommand = Get-Command `
+                    Get-AzContext `
+                    -ErrorAction SilentlyContinue
+
+                $AzStorageCommand = Get-Command `
+                    Get-AzStorageAccount `
+                    -ErrorAction SilentlyContinue
+
+                $AzShareCommand = Get-Command `
+                    Get-AzRmStorageShare `
+                    -ErrorAction SilentlyContinue
+
+                if (
+                    -not $AzContextCommand -or
+                    -not $AzStorageCommand -or
+                    -not $AzShareCommand
+                ) {
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Storage" `
+                        -Check "Azure Files capacity" `
+                        -Finding "Azure Files capacity was not checked because the required Azure PowerShell modules are not available." `
+                        -Evidence "$AzureStorageAccountName / $AzureFileShareName" `
+                        -Recommendation "Capacity can be checked automatically when Az.Accounts and Az.Storage are installed and an Azure session already exists."
+                }
+                else {
+
+                    try {
+
+                        $AzContext = Get-AzContext `
+                            -ErrorAction SilentlyContinue
+
+                        if (
+                            $null -eq $AzContext -or
+                            $null -eq $AzContext.Account -or
+                            $null -eq $AzContext.Subscription
+                        ) {
+
+                            Add-HealthResult `
+                                -Status "INFO" `
+                                -Category "Storage" `
+                                -Check "Azure Files capacity" `
+                                -Finding "Azure Files capacity was not checked because no authenticated Azure PowerShell context exists." `
+                                -Evidence "$AzureStorageAccountName / $AzureFileShareName" `
+                                -Recommendation "The audit does not initiate Azure authentication. If capacity data is required, authenticate to the appropriate Azure subscription before running the audit."
+                        }
+                        else {
+
+                            try {
+
+                                $MatchingStorageAccounts = @(
+                                    Get-AzStorageAccount `
+                                        -ErrorAction Stop |
+                                    Where-Object {
+                                        $_.StorageAccountName -eq
+                                        $AzureStorageAccountName
+                                    }
+                                )
+
+                                if ($MatchingStorageAccounts.Count -eq 0) {
+
+                                    Add-HealthResult `
+                                        -Status "INFO" `
+                                        -Category "Storage" `
+                                        -Check "Azure Files capacity" `
+                                        -Finding "The Azure storage account could not be found in the current Azure subscription." `
+                                        -Evidence "Storage account: $AzureStorageAccountName; Subscription: $($AzContext.Subscription.Name)" `
+                                        -Recommendation "Confirm that the current Azure context has access to the subscription containing this storage account."
+                                }
+                                else {
+
+                                    $StorageAccount =
+                                        $MatchingStorageAccounts[0]
+
+                                    $AzureShare = Get-AzRmStorageShare `
+                                        -ResourceGroupName $StorageAccount.ResourceGroupName `
+                                        -StorageAccountName $AzureStorageAccountName `
+                                        -Name $AzureFileShareName `
+                                        -GetShareUsage `
+                                        -ErrorAction Stop
+
+                                    $QuotaGiB =
+                                        [double]$AzureShare.QuotaGiB
+
+                                    $UsedBytes =
+                                        [double]$AzureShare.ShareUsageBytes
+
+                                    if (
+                                        $QuotaGiB -gt 0 -and
+                                        $UsedBytes -ge 0
+                                    ) {
+
+                                        $QuotaBytes =
+                                            $QuotaGiB * 1GB
+
+                                        $FreeBytes = [math]::Max(
+                                            0,
+                                            (
+                                                $QuotaBytes -
+                                                $UsedBytes
+                                            )
+                                        )
+
+                                        $UsedGiB = [math]::Round(
+                                            ($UsedBytes / 1GB),
+                                            2
+                                        )
+
+                                        $FreeGiB = [math]::Round(
+                                            ($FreeBytes / 1GB),
+                                            2
+                                        )
+
+                                        $FreePercent = [math]::Round(
+                                            (
+                                                (
+                                                    $FreeBytes /
+                                                    $QuotaBytes
+                                                ) * 100
+                                            ),
+                                            2
+                                        )
+
+                                        if ($FreePercent -lt 20) {
+
+                                            Add-HealthResult `
+                                                -Status "WARN" `
+                                                -Category "Storage" `
+                                                -Check "Azure Files capacity" `
+                                                -Finding "The Azure file share has less than 20% free capacity remaining." `
+                                                -Evidence "Share=$AzureFileShareName; Used=$UsedGiB GiB; Free=$FreeGiB GiB; Quota=$QuotaGiB GiB; Free=$FreePercent%" `
+                                                -Recommendation "Review Azure Files capacity and projected FSLogix profile growth."
+                                        }
+                                        else {
+
+                                            Add-HealthResult `
+                                                -Status "PASS" `
+                                                -Category "Storage" `
+                                                -Check "Azure Files capacity" `
+                                                -Finding "The Azure file share has at least 20% free capacity remaining." `
+                                                -Evidence "Share=$AzureFileShareName; Used=$UsedGiB GiB; Free=$FreeGiB GiB; Quota=$QuotaGiB GiB; Free=$FreePercent%"
+                                        }
+                                    }
+                                    else {
+
+                                        Add-HealthResult `
+                                            -Status "INFO" `
+                                            -Category "Storage" `
+                                            -Check "Azure Files capacity" `
+                                            -Finding "Azure Files capacity information was returned but could not be evaluated." `
+                                            -Evidence "QuotaGiB=$($AzureShare.QuotaGiB); ShareUsageBytes=$($AzureShare.ShareUsageBytes)"
+                                    }
+                                }
+                            }
+                            catch {
+
+                                Add-HealthResult `
+                                    -Status "INFO" `
+                                    -Category "Storage" `
+                                    -Check "Azure Files capacity" `
+                                    -Finding "Azure Files capacity could not be queried using the current Azure context." `
+                                    -Evidence $_.Exception.Message `
+                                    -Recommendation "Confirm that the current Azure account has permission to read the storage account and file share."
+                            }
+                        }
+                    }
+                    catch {
+
+                        Add-HealthResult `
+                            -Status "INFO" `
+                            -Category "Storage" `
+                            -Check "Azure Files capacity" `
+                            -Finding "Unable to determine whether an Azure PowerShell session is available." `
+                            -Evidence $_.Exception.Message
+                    }
+                }
+            }
+            else {
+
+                # --------------------------------------------
+                # Traditional SMB capacity
+                # --------------------------------------------
+
+                $TemporaryDriveName = "FSLAudit"
+
+                try {
+
+                    if (
+                        Get-PSDrive `
+                            -Name $TemporaryDriveName `
+                            -ErrorAction SilentlyContinue
+                    ) {
+
+                        Remove-PSDrive `
+                            -Name $TemporaryDriveName `
+                            -Force `
+                            -ErrorAction SilentlyContinue
+                    }
+
+                    $null = New-PSDrive `
+                        -Name $TemporaryDriveName `
+                        -PSProvider FileSystem `
+                        -Root $Location `
+                        -Scope Script `
+                        -ErrorAction Stop
+
+                    $DriveInfo = Get-PSDrive `
+                        -Name $TemporaryDriveName `
+                        -ErrorAction Stop
+
+                    if (
+                        $null -ne $DriveInfo.Free -and
+                        $null -ne $DriveInfo.Used -and
+                        ($DriveInfo.Free + $DriveInfo.Used) -gt 0
+                    ) {
+
+                        $TotalBytes =
+                            [double]$DriveInfo.Free +
+                            [double]$DriveInfo.Used
+
+                        $FreePercent = [math]::Round(
+                            (
+                                [double]$DriveInfo.Free /
+                                $TotalBytes
+                            ) * 100,
+                            2
+                        )
+
+                        $FreeGiB = [math]::Round(
+                            ([double]$DriveInfo.Free / 1GB),
+                            2
+                        )
+
+                        $TotalGiB = [math]::Round(
+                            ($TotalBytes / 1GB),
+                            2
+                        )
+
+                        if ($FreePercent -lt 20) {
+
+                            Add-HealthResult `
+                                -Status "WARN" `
+                                -Category "Storage" `
+                                -Check "SMB storage capacity" `
+                                -Finding "The profile storage has less than 20% free capacity remaining." `
+                                -Evidence "Free=$FreeGiB GiB; Total=$TotalGiB GiB; Free=$FreePercent%" `
+                                -Recommendation "Review available capacity and projected FSLogix profile growth."
+                        }
+                        else {
+
+                            Add-HealthResult `
+                                -Status "PASS" `
+                                -Category "Storage" `
+                                -Check "SMB storage capacity" `
+                                -Finding "The profile storage has at least 20% free capacity remaining." `
+                                -Evidence "Free=$FreeGiB GiB; Total=$TotalGiB GiB; Free=$FreePercent%"
+                        }
+                    }
+                    else {
+
+                        Add-HealthResult `
+                            -Status "INFO" `
+                            -Category "Storage" `
+                            -Check "SMB storage capacity" `
+                            -Finding "The SMB share is reachable, but capacity information was not exposed through the filesystem provider." `
+                            -Evidence $Location
+                    }
+                }
+                catch {
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Storage" `
+                        -Check "SMB storage capacity" `
+                        -Finding "Unable to determine capacity for the SMB profile share." `
+                        -Evidence $_.Exception.Message
+                }
+                finally {
+
+                    Remove-PSDrive `
+                        -Name $TemporaryDriveName `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+                }
             }
         }
         else {
@@ -1925,8 +2908,16 @@ $JsonFile = Join-Path `
     "FSLogix-Health-Audit-$ComputerName-$Timestamp.json"
 
 $JsonOutput = [PSCustomObject]@{
-    ComputerName = $ComputerName
-    Generated    = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    ScriptVersion = $ScriptVersion
+    ComputerName  = $ComputerName
+    Generated     = $Generated
+
+    AuditParameters = [PSCustomObject]@{
+        ReportPath              = $ReportPath
+        EventLookbackDays       = $EventLookbackDays
+        ContainerWarningPercent = $ContainerWarningPercent
+        MaxContainerFiles       = $MaxContainerFiles
+    }
 
     Summary = [PSCustomObject]@{
         Pass = $PassCount
@@ -1971,17 +2962,29 @@ $HtmlRows = foreach ($Result in $Results) {
         }
     }
 
+    $SafeCategory       = ConvertTo-HtmlSafe $Result.Category
+    $SafeStatus         = ConvertTo-HtmlSafe $Result.Status
+    $SafeCheck          = ConvertTo-HtmlSafe $Result.Check
+    $SafeFinding        = ConvertTo-HtmlSafe $Result.Finding
+    $SafeEvidence       = ConvertTo-HtmlSafe $Result.Evidence
+    $SafeRecommendation = ConvertTo-HtmlSafe $Result.Recommendation
+
     @"
 <tr class="$StatusClass">
-    <td>$($Result.Category)</td>
-    <td><strong>$($Result.Status)</strong></td>
-    <td>$($Result.Check)</td>
-    <td>$($Result.Finding)</td>
-    <td>$($Result.Evidence)</td>
-    <td>$($Result.Recommendation)</td>
+    <td>$SafeCategory</td>
+    <td><strong>$SafeStatus</strong></td>
+    <td>$SafeCheck</td>
+    <td>$SafeFinding</td>
+    <td>$SafeEvidence</td>
+    <td>$SafeRecommendation</td>
 </tr>
 "@
 }
+
+$SafeComputerName = ConvertTo-HtmlSafe $ComputerName
+$SafeGenerated    = ConvertTo-HtmlSafe $Generated
+$SafeVersion      = ConvertTo-HtmlSafe $ScriptVersion
+$SafeReportPath   = ConvertTo-HtmlSafe $ReportPath
 
 $Html = @"
 <!DOCTYPE html>
@@ -1990,7 +2993,7 @@ $Html = @"
 <head>
 <meta charset="utf-8">
 
-<title>FSLogix Health Audit - $ComputerName</title>
+<title>FSLogix Health Audit - $SafeComputerName</title>
 
 <style>
 
@@ -2008,6 +3011,21 @@ h1 {
 .meta {
     margin-bottom: 20px;
     color: #555;
+    line-height: 1.5;
+}
+
+.parameters {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 20px;
+    line-height: 1.5;
+}
+
+.parameters strong {
+    display: inline-block;
+    min-width: 210px;
 }
 
 .summary {
@@ -2052,6 +3070,7 @@ td {
     padding: 10px;
     border-bottom: 1px solid #ddd;
     vertical-align: top;
+    word-break: break-word;
 }
 
 .pass {
@@ -2078,8 +3097,16 @@ td {
 <h1>FSLogix Health Audit</h1>
 
 <div class="meta">
-Computer: $ComputerName<br>
-Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+Computer: $SafeComputerName<br>
+Generated: $SafeGenerated<br>
+Audit version: $SafeVersion
+</div>
+
+<div class="parameters">
+<strong>Event lookback:</strong> $EventLookbackDays days<br>
+<strong>Container warning threshold:</strong> $ContainerWarningPercent%<br>
+<strong>Maximum container files:</strong> $MaxContainerFiles<br>
+<strong>Report path:</strong> $SafeReportPath
 </div>
 
 <div class="summary">
@@ -2135,11 +3162,18 @@ $Html |
 Write-Host ""
 Write-Host "FSLogix Health Audit"
 Write-Host "--------------------"
+Write-Host "Version     : $ScriptVersion"
 Write-Host "Computer    : $ComputerName"
 Write-Host "PASS        : $PassCount"
 Write-Host "WARN        : $WarnCount"
 Write-Host "FAIL        : $FailCount"
 Write-Host "INFO        : $InfoCount"
+Write-Host ""
+Write-Host "Parameters"
+Write-Host "----------"
+Write-Host "Event lookback days       : $EventLookbackDays"
+Write-Host "Container warning percent : $ContainerWarningPercent"
+Write-Host "Maximum container files   : $MaxContainerFiles"
 Write-Host ""
 Write-Host "JSON report : $JsonFile"
 Write-Host "HTML report : $HtmlFile"
