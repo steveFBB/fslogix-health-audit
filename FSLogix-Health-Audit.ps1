@@ -1798,32 +1798,6 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "VHDX is preferred for new containers. Changing this setting does not convert existing VHD containers."
         }
 
-        $FlipFlopProfileDirectoryName =
-            Get-EffectiveProfileSetting `
-                -ProfileConfig $ProfileConfig `
-                -Name "FlipFlopProfileDirectoryName" `
-                -DefaultValue 0
-
-        if ([int]$FlipFlopProfileDirectoryName.Value -eq 1) {
-
-            Add-HealthResult `
-                -Status "PASS" `
-                -Category "Configuration" `
-                -Check "Profile directory naming" `
-                -Finding "FlipFlopProfileDirectoryName is enabled." `
-                -Evidence "Effective value: 1; Configured=$($FlipFlopProfileDirectoryName.Configured)"
-        }
-        else {
-
-            Add-HealthResult `
-                -Status "INFO" `
-                -Category "Configuration" `
-                -Check "Profile directory naming" `
-                -Finding "FlipFlopProfileDirectoryName is not enabled." `
-                -Evidence "Effective value: $($FlipFlopProfileDirectoryName.Value); Configured=$($FlipFlopProfileDirectoryName.Configured)" `
-                -Recommendation "Microsoft recommends this setting for easier container-folder browsing, but changing it in an existing environment can cause FSLogix to create new profile directories. Do not change it without planning the profile-folder migration."
-        }
-
         # ----------------------------------------------------
         # Optional redirections.xml validation
         # ----------------------------------------------------
@@ -2764,25 +2738,14 @@ if ($FSLogixInstalled) {
             $DefenderStatus.RealTimeProtectionEnabled -eq $true
         )
 
-        if ($DefenderActive) {
-
-            Add-HealthResult `
-                -Status "INFO" `
-                -Category "Antivirus" `
-                -Check "Active antivirus" `
-                -Finding "Microsoft Defender Antivirus is active." `
-                -Evidence "AntivirusEnabled=True; RealTimeProtectionEnabled=True"
-        }
-        else {
-
-            Add-HealthResult `
-                -Status "INFO" `
-                -Category "Antivirus" `
-                -Check "Active antivirus" `
-                -Finding "Microsoft Defender is installed but does not appear to be the active real-time antivirus engine." `
-                -Evidence "AntivirusEnabled=$($DefenderStatus.AntivirusEnabled); RealTimeProtectionEnabled=$($DefenderStatus.RealTimeProtectionEnabled)" `
-                -Recommendation "Validate FSLogix exclusions in the active antivirus product."
-        }
+        # Defender state is shown in the exclusions result evidence.
+        $DefenderStateText =
+            if ($DefenderActive) {
+                "Defender active: Yes"
+            }
+            else {
+                "Defender active: No (AntivirusEnabled=$($DefenderStatus.AntivirusEnabled); RealTimeProtectionEnabled=$($DefenderStatus.RealTimeProtectionEnabled))"
+            }
 
         $ExclusionsHidden =
             Test-DefenderExclusionsHidden `
@@ -2798,7 +2761,7 @@ if ($FSLogixInstalled) {
                 -Category "Antivirus" `
                 -Check "FSLogix Defender exclusions" `
                 -Finding "Defender exclusions were not validated because the audit is not running elevated." `
-                -Evidence "Identity=$RunAsIdentity; Elevated=False" `
+                -Evidence "$DefenderStateText; Identity=$RunAsIdentity; Elevated=False" `
                 -Recommendation "Run the audit from an elevated PowerShell session if Defender exclusion validation is required."
         }
         elseif ($ExclusionsHidden) {
@@ -2808,7 +2771,7 @@ if ($FSLogixInstalled) {
                 -Category "Antivirus" `
                 -Check "FSLogix Defender exclusions" `
                 -Finding "Defender exclusions are hidden from local PowerShell and could not be reliably validated." `
-                -Evidence "HideExclusionsFromLocalAdmins is enabled or hidden exclusion data was returned." `
+                -Evidence "$DefenderStateText; HideExclusionsFromLocalAdmins is enabled or hidden exclusion data was returned." `
                 -Recommendation "Validate the effective FSLogix exclusions in the centrally managed Defender policy."
         }
         else {
@@ -2973,7 +2936,7 @@ if ($FSLogixInstalled) {
                     -Category "Antivirus" `
                     -Check "FSLogix Defender exclusions" `
                     -Finding "Required FSLogix Defender exclusions are covered." `
-                    -Evidence "Validated using effective Defender path, process and extension exclusions."
+                    -Evidence "$DefenderStateText; Validated using effective Defender path, process and extension exclusions."
             }
             else {
 
@@ -2987,7 +2950,7 @@ if ($FSLogixInstalled) {
                         -Category "Antivirus" `
                         -Check "FSLogix Defender exclusions" `
                         -Finding "$($MissingExclusions.Count) required FSLogix exclusion(s) are not covered." `
-                        -Evidence $MissingText `
+                        -Evidence "$DefenderStateText; Missing: $MissingText" `
                         -Recommendation "Add or correct the missing FSLogix exclusions in Microsoft Defender."
                 }
                 else {
@@ -2997,7 +2960,7 @@ if ($FSLogixInstalled) {
                         -Category "Antivirus" `
                         -Check "FSLogix Defender exclusions" `
                         -Finding "Defender exclusions are incomplete, but Defender does not appear to be the active real-time antivirus engine." `
-                        -Evidence $MissingText `
+                        -Evidence "$DefenderStateText; Missing: $MissingText" `
                         -Recommendation "Validate equivalent FSLogix exclusions in the active antivirus product."
                 }
             }
