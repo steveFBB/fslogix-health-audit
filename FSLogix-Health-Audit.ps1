@@ -13,7 +13,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "0.9.1"
+$ScriptVersion = "0.9.2"
 
 # ------------------------------------------------------------
 # Execution metadata
@@ -21,9 +21,9 @@ $ScriptVersion = "0.9.1"
 
 try {
     $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal(
-        $CurrentIdentity
-    )
+
+    $CurrentPrincipal = New-Object `
+        Security.Principal.WindowsPrincipal($CurrentIdentity)
 
     $RunAsIdentity = $CurrentIdentity.Name
 
@@ -32,6 +32,7 @@ try {
     )
 }
 catch {
+
     $RunAsIdentity = whoami 2>$null
 
     if ([string]::IsNullOrWhiteSpace($RunAsIdentity)) {
@@ -120,6 +121,10 @@ $Generated    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 $Results = New-Object System.Collections.Generic.List[object]
 
+# ------------------------------------------------------------
+# Result helper
+# ------------------------------------------------------------
+
 function Add-HealthResult {
     param (
         [Parameter(Mandatory)]
@@ -137,15 +142,21 @@ function Add-HealthResult {
         [string]$Category = "General"
     )
 
-    $Results.Add([PSCustomObject]@{
-        Category       = $Category
-        Status         = $Status
-        Check          = $Check
-        Finding        = $Finding
-        Evidence       = $Evidence
-        Recommendation = $Recommendation
-    })
+    $Results.Add(
+        [PSCustomObject]@{
+            Category       = $Category
+            Status         = $Status
+            Check          = $Check
+            Finding        = $Finding
+            Evidence       = $Evidence
+            Recommendation = $Recommendation
+        }
+    )
 }
+
+# ------------------------------------------------------------
+# HTML helper
+# ------------------------------------------------------------
 
 function ConvertTo-HtmlSafe {
     param (
@@ -162,6 +173,10 @@ function ConvertTo-HtmlSafe {
     )
 }
 
+# ------------------------------------------------------------
+# Path helpers
+# ------------------------------------------------------------
+
 function Normalize-PathString {
     param (
         [string]$Path
@@ -174,7 +189,11 @@ function Normalize-PathString {
     $Normalized = $Path.Trim()
 
     $Normalized = $Normalized -replace '(?i)%username%', '*'
-    $Normalized = [Environment]::ExpandEnvironmentVariables($Normalized)
+
+    $Normalized = [Environment]::ExpandEnvironmentVariables(
+        $Normalized
+    )
+
     $Normalized = $Normalized -replace '/', '\'
     $Normalized = $Normalized.TrimEnd('\')
 
@@ -215,15 +234,21 @@ function Test-PathCoverage {
             continue
         }
 
-        # Exact match, including identical wildcard expressions.
+        # Exact match.
         if ($Configured -eq $Required) {
             return $true
         }
 
-        # A literal parent folder covers anything below it.
+        # A literal parent folder covers everything beneath it,
+        # including a required path containing wildcards.
+        #
+        # Example:
+        # C:\ProgramData\FSLogix
+        #
+        # covers:
+        # C:\ProgramData\FSLogix\Cache\*
         if (
             -not $Configured.Contains("*") -and
-            -not $Required.Contains("*") -and
             $Required.StartsWith(
                 $Configured.TrimEnd('\') + '\',
                 [System.StringComparison]::OrdinalIgnoreCase
@@ -232,18 +257,16 @@ function Test-PathCoverage {
             return $true
         }
 
-        # A configured wildcard exclusion may cover a specific required path.
-        # Escape literal wildcard metacharacters such as [ and ], preserving
-        # only * as an intended wildcard.
+        # A configured wildcard exclusion may cover a specific
+        # required path.
         if ($Configured.Contains("*")) {
 
             $ConfiguredPattern =
-                ConvertTo-SafeWildcardPattern -Pattern $Configured
+                ConvertTo-SafeWildcardPattern `
+                    -Pattern $Configured
 
-            # If the required expression itself contains wildcards, only
-            # identical wildcard expressions were accepted above. Do not
-            # allow a specific configured path/pattern to incorrectly cover
-            # a broader required wildcard path.
+            # Do not allow a narrow configured wildcard to be
+            # interpreted as covering a broader required wildcard.
             if (-not $Required.Contains("*")) {
 
                 if ($Required -like $ConfiguredPattern) {
@@ -337,42 +360,21 @@ function Test-ShareContainerCoverage {
 
     foreach ($Pattern in $RequiredPatterns) {
 
-        $NormalizedPattern = Normalize-PathString $Pattern
+        $Covered = Test-PathCoverage `
+            -RequiredPath $Pattern `
+            -ConfiguredPaths $ConfiguredPaths
 
-        $Matched = $false
-
-        foreach ($ConfiguredPath in $ConfiguredPaths) {
-
-            $Configured = Normalize-PathString $ConfiguredPath
-
-            if ([string]::IsNullOrWhiteSpace($Configured)) {
-                continue
-            }
-
-            if ($Configured -eq $NormalizedPattern) {
-                $Matched = $true
-                break
-            }
-
-            if (
-                -not $Configured.Contains("*") -and
-                $NormalizedPattern.StartsWith(
-                    $Configured.TrimEnd('\') + '\',
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            ) {
-                $Matched = $true
-                break
-            }
-        }
-
-        if (-not $Matched) {
+        if (-not $Covered) {
             return $false
         }
     }
 
     return $true
 }
+
+# ------------------------------------------------------------
+# Local group helpers
+# ------------------------------------------------------------
 
 function Get-LocalGroupMemberNames {
     param (
@@ -433,6 +435,10 @@ function Test-EveryoneMembership {
     return $false
 }
 
+# ------------------------------------------------------------
+# Registry setting helper
+# ------------------------------------------------------------
+
 function Get-EffectiveProfileSetting {
     param (
         [Parameter(Mandatory)]
@@ -461,6 +467,10 @@ function Get-EffectiveProfileSetting {
     }
 }
 
+# ------------------------------------------------------------
+# Standard VHDLocations parser
+# ------------------------------------------------------------
+
 function Get-NormalizedVHDLocations {
     param (
         [AllowNull()]
@@ -475,11 +485,13 @@ function Get-NormalizedVHDLocations {
             continue
         }
 
+        # REG_SZ may contain multiple locations separated by ;
         foreach ($Location in ([string]$Entry -split ';')) {
 
             $Location = $Location.Trim()
 
             if (-not [string]::IsNullOrWhiteSpace($Location)) {
+
                 $Locations += $Location.TrimEnd('\')
             }
         }
@@ -491,42 +503,87 @@ function Get-NormalizedVHDLocations {
     )
 }
 
-function Get-CloudCacheLocations {
+# ------------------------------------------------------------
+# Cloud Cache CCDLocations parser
+# ------------------------------------------------------------
+
+function Get-CloudCacheProviders {
     param (
         [AllowNull()]
         $RawValue
     )
 
-    $Locations = @()
+    $Providers = @()
 
-    foreach ($Entry in @($RawValue)) {
+    foreach ($RawEntry in @($RawValue)) {
 
-        if ([string]::IsNullOrWhiteSpace([string]$Entry)) {
+        if ([string]::IsNullOrWhiteSpace([string]$RawEntry)) {
             continue
         }
 
-        $EntryText = [string]$Entry
-
-        $MatchesFound = [regex]::Matches(
-            $EntryText,
-            '(?i)(?:^|;)\s*connectionString\s*=\s*([^;]+)'
+        # CCDLocations providers are separated by semicolons.
+        # Provider properties themselves are comma separated.
+        $ProviderEntries = @(
+            ([string]$RawEntry -split ';') |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            }
         )
 
-        foreach ($Match in $MatchesFound) {
+        foreach ($ProviderEntry in $ProviderEntries) {
 
-            $Location = $Match.Groups[1].Value.Trim()
+            $EntryText = $ProviderEntry.Trim()
 
-            if (-not [string]::IsNullOrWhiteSpace($Location)) {
-                $Locations += $Location.TrimEnd('\')
+            $TypeMatch = [regex]::Match(
+                $EntryText,
+                '(?i)(?:^|,)\s*type\s*=\s*(?<value>[^,;]+)'
+            )
+
+            $NameMatch = [regex]::Match(
+                $EntryText,
+                '(?i)(?:^|,)\s*name\s*=\s*"?(?<value>[^",;]+)"?'
+            )
+
+            $ConnectionMatch = [regex]::Match(
+                $EntryText,
+                '(?i)(?:^|,)\s*connectionString\s*=\s*"?(?<value>[^";]+)"?'
+            )
+
+            if (
+                -not $TypeMatch.Success -or
+                -not $ConnectionMatch.Success
+            ) {
+                continue
+            }
+
+            $ProviderType =
+                $TypeMatch.Groups["value"].Value.Trim()
+
+            $ProviderName = if ($NameMatch.Success) {
+                $NameMatch.Groups["value"].Value.Trim()
+            }
+            else {
+                ""
+            }
+
+            $ConnectionString =
+                $ConnectionMatch.Groups["value"].Value.Trim().Trim('"')
+
+            $Providers += [PSCustomObject]@{
+                Type             = $ProviderType
+                Name             = $ProviderName
+                ConnectionString = $ConnectionString
+                Raw              = $EntryText
             }
         }
     }
 
-    return @(
-        $Locations |
-        Select-Object -Unique
-    )
+    return @($Providers)
 }
+
+# ------------------------------------------------------------
+# Container inventory helper
+# ------------------------------------------------------------
 
 function Get-ContainerFiles {
     param (
@@ -603,6 +660,10 @@ function Get-ContainerFiles {
     }
 }
 
+# ------------------------------------------------------------
+# SID helper
+# ------------------------------------------------------------
+
 function Resolve-SidToName {
     param (
         [Parameter(Mandatory)]
@@ -611,9 +672,10 @@ function Resolve-SidToName {
 
     try {
 
-        $SidObject = New-Object System.Security.Principal.SecurityIdentifier(
-            $Sid
-        )
+        $SidObject =
+            New-Object System.Security.Principal.SecurityIdentifier(
+                $Sid
+            )
 
         $Account = $SidObject.Translate(
             [System.Security.Principal.NTAccount]
@@ -622,23 +684,45 @@ function Resolve-SidToName {
         return $Account.Value
     }
     catch {
+
         return $Sid
     }
 }
 
+# ------------------------------------------------------------
+# FSLogix session status helpers
+# ------------------------------------------------------------
+
 function Get-SessionStatusDescription {
     param (
-        [int]$Status
+        [AllowNull()]
+        [Nullable[int]]$Status
     )
+
+    if ($null -eq $Status) {
+        return "Status value unavailable"
+    }
 
     switch ($Status) {
 
-        0   { return "Success" }
-        100 { return "Profile loading" }
-        200 { return "Profile unloading" }
-        300 { return "Profile loaded" }
+        0 {
+            return "Success"
+        }
+
+        100 {
+            return "Waiting for Windows Profile Service to determine the profile folder"
+        }
+
+        200 {
+            return "Profile setup in progress"
+        }
+
+        300 {
+            return "Profile already attached (differencing-disk scenario)"
+        }
 
         default {
+
             if ($Status -ge 1 -and $Status -le 28) {
                 return "FSLogix error state"
             }
@@ -648,8 +732,110 @@ function Get-SessionStatusDescription {
     }
 }
 
+function Get-SessionReasonDescription {
+    param (
+        [int]$Reason
+    )
+
+    switch ($Reason) {
+
+        0 {
+            return "No reason condition"
+        }
+
+        1 {
+            return "User isn't included for FSLogix processing"
+        }
+
+        2 {
+            return "User is excluded from FSLogix processing"
+        }
+
+        3 {
+            return "A local profile already exists"
+        }
+
+        4 {
+            return "User type isn't appropriate for FSLogix processing"
+        }
+
+        7 {
+            return "Windows temporary profile condition"
+        }
+
+        8 {
+            return "Session isn't an Azure Virtual Desktop session"
+        }
+
+        9 {
+            return "Profile load failed"
+        }
+
+        default {
+            return "Unclassified reason"
+        }
+    }
+}
+
+function Get-SessionReasonSeverity {
+    param (
+        [int]$Reason
+    )
+
+    switch ($Reason) {
+
+        0 {
+            return "PASS"
+        }
+
+        1 {
+            return "INFO"
+        }
+
+        2 {
+            return "INFO"
+        }
+
+        3 {
+            return "WARN"
+        }
+
+        4 {
+            return "INFO"
+        }
+
+        7 {
+            return "WARN"
+        }
+
+        8 {
+            return "INFO"
+        }
+
+        9 {
+            return "WARN"
+        }
+
+        default {
+
+            if ($Reason -ne 0) {
+                return "INFO"
+            }
+
+            return "PASS"
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# Defender hidden-exclusion helper
+# ------------------------------------------------------------
+
 function Test-DefenderExclusionsHidden {
     param (
+        [AllowNull()]
+        $Preference,
+
         [AllowEmptyCollection()]
         [string[]]$Paths = @(),
 
@@ -659,6 +845,24 @@ function Test-DefenderExclusionsHidden {
         [AllowEmptyCollection()]
         [string[]]$Extensions = @()
     )
+
+    if ($null -ne $Preference) {
+
+        $HideProperty =
+            $Preference.PSObject.Properties[
+                "HideExclusionsFromLocalAdmins"
+            ]
+
+        if (
+            $null -ne $HideProperty -and
+            (
+                $HideProperty.Value -eq $true -or
+                $HideProperty.Value -eq 1
+            )
+        ) {
+            return $true
+        }
+    }
 
     $AllValues = @(
         $Paths
@@ -678,6 +882,10 @@ function Test-DefenderExclusionsHidden {
 
     return $false
 }
+
+# ------------------------------------------------------------
+# Event classification helper
+# ------------------------------------------------------------
 
 function Get-FSLogixEventClassification {
     param (
@@ -753,9 +961,9 @@ function Get-FSLogixEventClassification {
     }
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Host information
-# ------------------------------------------------------------
+# ============================================================
 
 $DomainJoined  = $false
 $AzureAdJoined = $false
@@ -841,9 +1049,9 @@ catch {
         -Evidence $_.Exception.Message
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Current Active Directory / domain health
-# ------------------------------------------------------------
+# ============================================================
 
 if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
 
@@ -857,8 +1065,9 @@ if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
 
         try {
 
-            $SecureChannel = Test-ComputerSecureChannel `
-                -ErrorAction Stop
+            $SecureChannel =
+                Test-ComputerSecureChannel `
+                    -ErrorAction Stop
 
             $SecureChannelChecked = $true
 
@@ -883,6 +1092,7 @@ if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
             }
         }
         catch {
+
             $SecureChannelChecked = $false
         }
     }
@@ -943,6 +1153,7 @@ if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
             foreach ($Line in $NltestOutput) {
 
                 if ($Line -match '^\s*DC:\s*\\\\(.+?)\s*$') {
+
                     $DcName = $Matches[1].Trim()
                     break
                 }
@@ -985,12 +1196,14 @@ if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
 
     try {
 
-        $ResolveDnsNameCommand = Get-Command Resolve-DnsName `
+        $ResolveDnsNameCommand = Get-Command `
+            Resolve-DnsName `
             -ErrorAction SilentlyContinue
 
         if ($ResolveDnsNameCommand) {
 
-            $SrvName = "_ldap._tcp.dc._msdcs.$DomainName"
+            $SrvName =
+                "_ldap._tcp.dc._msdcs.$DomainName"
 
             $SrvRecords = @(
                 Resolve-DnsName `
@@ -1006,7 +1219,9 @@ if ($DomainJoined -and -not [string]::IsNullOrWhiteSpace($DomainName)) {
 
                 $SrvTargets = (
                     $SrvRecords |
-                    Select-Object -ExpandProperty NameTarget -Unique
+                    Select-Object `
+                        -ExpandProperty NameTarget `
+                        -Unique
                 ) -join "; "
 
                 Add-HealthResult `
@@ -1056,21 +1271,24 @@ else {
         -Finding "Domain health checks were skipped because this device is not domain joined."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix installation
-# ------------------------------------------------------------
+# ============================================================
 
 $FSLogixPath      = "C:\Program Files\FSLogix\Apps"
 $FSLogixInstalled = $false
 
 if (Test-Path $FSLogixPath) {
 
-    $FrxSvcExe = Join-Path $FSLogixPath "frxsvc.exe"
+    $FrxSvcExe =
+        Join-Path $FSLogixPath "frxsvc.exe"
 
     if (Test-Path $FrxSvcExe) {
 
         $FSLogixInstalled = $true
-        $Version = (Get-Item $FrxSvcExe).VersionInfo.FileVersion
+
+        $Version =
+            (Get-Item $FrxSvcExe).VersionInfo.FileVersion
 
         Add-HealthResult `
             -Status "PASS" `
@@ -1098,9 +1316,9 @@ else {
         -Finding "FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix service
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -1150,14 +1368,16 @@ else {
         -Finding "Service check skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix Profile Container configuration
-# ------------------------------------------------------------
+# ============================================================
 
 $ProfilesRegPath         = "HKLM:\SOFTWARE\FSLogix\Profiles"
 $ProfileConfig           = $null
 $VHDLocations            = @()
-$CCDLocations            = @()
+$CloudCacheProviders     = @()
+$CloudCacheSMBLocations  = @()
+$CloudCacheAzureProviders = @()
 $ProfileStorageLocations = @()
 $CloudCacheEnabled       = $false
 $EffectiveSizeInMBs      = 30000
@@ -1166,7 +1386,8 @@ if (Test-Path $ProfilesRegPath) {
 
     try {
 
-        $ProfileConfig = Get-ItemProperty -Path $ProfilesRegPath
+        $ProfileConfig =
+            Get-ItemProperty -Path $ProfilesRegPath
 
         if ($ProfileConfig.Enabled -eq 1) {
 
@@ -1189,7 +1410,7 @@ if (Test-Path $ProfilesRegPath) {
         }
 
         # ----------------------------------------------------
-        # Standard VHDLocations
+        # VHDLocations
         # ----------------------------------------------------
 
         if ($null -ne $ProfileConfig.VHDLocations) {
@@ -1201,20 +1422,42 @@ if (Test-Path $ProfilesRegPath) {
         }
 
         # ----------------------------------------------------
-        # Cloud Cache CCDLocations
+        # CCDLocations / Cloud Cache
         # ----------------------------------------------------
 
         if ($null -ne $ProfileConfig.CCDLocations) {
 
-            $CCDLocations = @(
-                Get-CloudCacheLocations `
+            $CloudCacheProviders = @(
+                Get-CloudCacheProviders `
                     -RawValue $ProfileConfig.CCDLocations
             )
 
-            if ($CCDLocations.Count -gt 0) {
+            if ($CloudCacheProviders.Count -gt 0) {
                 $CloudCacheEnabled = $true
             }
+
+            $CloudCacheSMBLocations = @(
+                $CloudCacheProviders |
+                Where-Object {
+                    $_.Type -ieq "smb"
+                } |
+                ForEach-Object {
+                    $_.ConnectionString.TrimEnd('\')
+                } |
+                Select-Object -Unique
+            )
+
+            $CloudCacheAzureProviders = @(
+                $CloudCacheProviders |
+                Where-Object {
+                    $_.Type -ieq "azure"
+                }
+            )
         }
+
+        # ----------------------------------------------------
+        # Storage configuration result
+        # ----------------------------------------------------
 
         if (
             $VHDLocations.Count -gt 0 -and
@@ -1226,17 +1469,39 @@ if (Test-Path $ProfilesRegPath) {
                 -Category "Configuration" `
                 -Check "Profile storage configuration" `
                 -Finding "Both VHDLocations and CCDLocations are configured." `
-                -Evidence "VHDLocations=$($VHDLocations -join '; '); CCDLocations=$($CCDLocations -join '; ')" `
+                -Evidence "VHDLocations=$($VHDLocations -join '; '); CloudCacheProviders=$($CloudCacheProviders.Count)" `
                 -Recommendation "Review the configuration. Cloud Cache uses CCDLocations and VHDLocations should not normally be configured at the same time."
         }
         elseif ($CloudCacheEnabled) {
+
+            $ProviderEvidence = (
+                $CloudCacheProviders |
+                ForEach-Object {
+
+                    if ($_.Name) {
+                        "$($_.Type): $($_.Name)"
+                    }
+                    else {
+                        "$($_.Type) provider"
+                    }
+                }
+            ) -join "; "
 
             Add-HealthResult `
                 -Status "PASS" `
                 -Category "Configuration" `
                 -Check "Cloud Cache locations" `
                 -Finding "Cloud Cache profile storage is configured." `
-                -Evidence ($CCDLocations -join "; ")
+                -Evidence "Providers=$($CloudCacheProviders.Count); $ProviderEvidence"
+        }
+        elseif ($null -ne $ProfileConfig.CCDLocations) {
+
+            Add-HealthResult `
+                -Status "FAIL" `
+                -Category "Configuration" `
+                -Check "Cloud Cache locations" `
+                -Finding "CCDLocations is configured but no usable Cloud Cache providers could be parsed." `
+                -Recommendation "Review the CCDLocations syntax."
         }
         elseif ($VHDLocations.Count -gt 0) {
 
@@ -1253,16 +1518,54 @@ if (Test-Path $ProfilesRegPath) {
                 -Status "FAIL" `
                 -Category "Configuration" `
                 -Check "Profile storage configuration" `
-                -Finding "Neither VHDLocations nor usable CCDLocations are configured." `
+                -Finding "Neither VHDLocations nor CCDLocations are configured." `
                 -Recommendation "Configure a valid FSLogix profile storage location."
         }
 
         if ($CloudCacheEnabled) {
-            $ProfileStorageLocations = @($CCDLocations)
+
+            # Only SMB Cloud Cache providers can be tested with
+            # Test-Path, TCP 445 and file enumeration.
+            $ProfileStorageLocations =
+                @($CloudCacheSMBLocations)
         }
         else {
-            $ProfileStorageLocations = @($VHDLocations)
+
+            $ProfileStorageLocations =
+                @($VHDLocations)
         }
+
+        # ----------------------------------------------------
+        # Azure page blob Cloud Cache providers
+        # ----------------------------------------------------
+
+        if ($CloudCacheAzureProviders.Count -gt 0) {
+
+            $AzureProviderNames = (
+                $CloudCacheAzureProviders |
+                ForEach-Object {
+
+                    if ($_.Name) {
+                        $_.Name
+                    }
+                    else {
+                        "Unnamed Azure provider"
+                    }
+                }
+            ) -join "; "
+
+            Add-HealthResult `
+                -Status "INFO" `
+                -Category "Storage" `
+                -Check "Cloud Cache Azure providers" `
+                -Finding "$($CloudCacheAzureProviders.Count) Azure page-blob Cloud Cache provider(s) are configured." `
+                -Evidence $AzureProviderNames `
+                -Recommendation "Azure page-blob Cloud Cache providers are recognised but are not tested using SMB/UNC connectivity checks."
+        }
+
+        # ----------------------------------------------------
+        # Core profile settings
+        # ----------------------------------------------------
 
         if ($ProfileConfig.DeleteLocalProfileWhenVHDShouldApply -eq 1) {
 
@@ -1328,10 +1631,11 @@ if (Test-Path $ProfilesRegPath) {
         # Recommended configuration baseline
         # ----------------------------------------------------
 
-        $LockedRetryCount = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "LockedRetryCount" `
-            -DefaultValue 12
+        $LockedRetryCount =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "LockedRetryCount" `
+                -DefaultValue 12
 
         if ([int]$LockedRetryCount.Value -eq 3) {
 
@@ -1353,10 +1657,11 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "Review whether LockedRetryCount should be set to 3 to provide a faster failure response when a container is locked."
         }
 
-        $LockedRetryInterval = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "LockedRetryInterval" `
-            -DefaultValue 5
+        $LockedRetryInterval =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "LockedRetryInterval" `
+                -DefaultValue 5
 
         if ([int]$LockedRetryInterval.Value -eq 15) {
 
@@ -1378,10 +1683,11 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "Review whether LockedRetryInterval should be set to 15."
         }
 
-        $ReAttachRetryCount = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "ReAttachRetryCount" `
-            -DefaultValue 60
+        $ReAttachRetryCount =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "ReAttachRetryCount" `
+                -DefaultValue 60
 
         if ([int]$ReAttachRetryCount.Value -eq 3) {
 
@@ -1403,10 +1709,11 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "Review whether ReAttachRetryCount should be set to 3 to provide a faster failure response after an unexpected container disconnect."
         }
 
-        $ReAttachIntervalSeconds = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "ReAttachIntervalSeconds" `
-            -DefaultValue 10
+        $ReAttachIntervalSeconds =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "ReAttachIntervalSeconds" `
+                -DefaultValue 10
 
         if ([int]$ReAttachIntervalSeconds.Value -eq 15) {
 
@@ -1428,10 +1735,11 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "Review whether ReAttachIntervalSeconds should be set to 15."
         }
 
-        $ProfileType = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "ProfileType" `
-            -DefaultValue 0
+        $ProfileType =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "ProfileType" `
+                -DefaultValue 0
 
         if ([int]$ProfileType.Value -eq 0) {
 
@@ -1453,12 +1761,14 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "Confirm that concurrent profile access is intentional and consistently configured across all hosts."
         }
 
-        $SizeInMBs = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "SizeInMBs" `
-            -DefaultValue 30000
+        $SizeInMBs =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "SizeInMBs" `
+                -DefaultValue 30000
 
-        $EffectiveSizeInMBs = [double]$SizeInMBs.Value
+        $EffectiveSizeInMBs =
+            [double]$SizeInMBs.Value
 
         Add-HealthResult `
             -Status "INFO" `
@@ -1467,13 +1777,15 @@ if (Test-Path $ProfilesRegPath) {
             -Finding "The effective profile container maximum size is $($SizeInMBs.Value) MB." `
             -Evidence "SizeInMBs=$($SizeInMBs.Value); Configured=$($SizeInMBs.Configured)"
 
-        $VolumeType = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "VolumeType" `
-            -DefaultValue "vhd"
+        $VolumeType =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "VolumeType" `
+                -DefaultValue "vhd"
 
         if (
-            ([string]$VolumeType.Value).Trim().ToLowerInvariant() -eq "vhdx"
+            ([string]$VolumeType.Value).Trim().ToLowerInvariant() -eq
+            "vhdx"
         ) {
 
             Add-HealthResult `
@@ -1494,10 +1806,11 @@ if (Test-Path $ProfilesRegPath) {
                 -Recommendation "VHDX is preferred for new containers. Changing this setting does not convert existing VHD containers."
         }
 
-        $FlipFlopProfileDirectoryName = Get-EffectiveProfileSetting `
-            -ProfileConfig $ProfileConfig `
-            -Name "FlipFlopProfileDirectoryName" `
-            -DefaultValue 0
+        $FlipFlopProfileDirectoryName =
+            Get-EffectiveProfileSetting `
+                -ProfileConfig $ProfileConfig `
+                -Name "FlipFlopProfileDirectoryName" `
+                -DefaultValue 0
 
         if ([int]$FlipFlopProfileDirectoryName.Value -eq 1) {
 
@@ -1530,15 +1843,18 @@ if (Test-Path $ProfilesRegPath) {
             )
         ) {
 
-            $RedirSource = [Environment]::ExpandEnvironmentVariables(
-                [string]$ProfileConfig.RedirXMLSourceFolder
-            )
+            $RedirSource =
+                [Environment]::ExpandEnvironmentVariables(
+                    [string]$ProfileConfig.RedirXMLSourceFolder
+                )
 
-            $RedirSource = $RedirSource.TrimEnd('\')
+            $RedirSource =
+                $RedirSource.TrimEnd('\')
 
-            $RedirFile = Join-Path `
-                $RedirSource `
-                "redirections.xml"
+            $RedirFile =
+                Join-Path `
+                    $RedirSource `
+                    "redirections.xml"
 
             try {
 
@@ -1552,11 +1868,13 @@ if (Test-Path $ProfilesRegPath) {
                         -Evidence $RedirSource `
                         -Recommendation "Verify the source path and that users/session hosts have read access."
                 }
-                elseif (-not (
-                    Test-Path `
-                        -LiteralPath $RedirFile `
-                        -PathType Leaf
-                )) {
+                elseif (
+                    -not (
+                        Test-Path `
+                            -LiteralPath $RedirFile `
+                            -PathType Leaf
+                    )
+                ) {
 
                     Add-HealthResult `
                         -Status "FAIL" `
@@ -1570,10 +1888,11 @@ if (Test-Path $ProfilesRegPath) {
 
                     try {
 
-                        [xml]$RedirXml = Get-Content `
-                            -LiteralPath $RedirFile `
-                            -Raw `
-                            -ErrorAction Stop
+                        [xml]$RedirXml =
+                            Get-Content `
+                                -LiteralPath $RedirFile `
+                                -Raw `
+                                -ErrorAction Stop
 
                         if (
                             $null -eq
@@ -1652,9 +1971,9 @@ else {
         -Finding "FSLogix Profiles registry configuration was not found."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix minifilter drivers
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -1668,7 +1987,8 @@ if ($FSLogixInstalled) {
 
     foreach ($DriverFile in $DriverFiles) {
 
-        $DriverPath = Join-Path $FSLogixPath $DriverFile
+        $DriverPath =
+            Join-Path $FSLogixPath $DriverFile
 
         if (-not (Test-Path -LiteralPath $DriverPath)) {
             $MissingDriverFiles += $DriverFile
@@ -1718,8 +2038,13 @@ if ($FSLogixInstalled) {
 
             foreach ($Line in $FltmcOutput) {
 
-                if ($Line -match '^\s*(frxdrv|frxdrvvt|frxccd)\s+') {
-                    $LoadedFilters += $Matches[1].ToLowerInvariant()
+                if (
+                    $Line -match
+                    '^\s*(frxdrv|frxdrvvt|frxccd)\s+'
+                ) {
+
+                    $LoadedFilters +=
+                        $Matches[1].ToLowerInvariant()
                 }
             }
 
@@ -1773,9 +2098,9 @@ else {
         -Finding "Driver checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix local include/exclude groups
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -1797,9 +2122,10 @@ if ($FSLogixInstalled) {
 
             try {
 
-                $null = Get-LocalGroup `
-                    -Name $GroupName `
-                    -ErrorAction Stop
+                $null =
+                    Get-LocalGroup `
+                        -Name $GroupName `
+                        -ErrorAction Stop
 
                 $GroupExists = $true
             }
@@ -1807,11 +2133,14 @@ if ($FSLogixInstalled) {
 
                 try {
 
-                    $Group = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+                    $Group =
+                        [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+
                     $null = $Group.Name
                     $GroupExists = $true
                 }
                 catch {
+
                     $GroupExists = $false
                 }
             }
@@ -1824,6 +2153,7 @@ if ($FSLogixInstalled) {
             }
         }
         catch {
+
             $MissingGroups += $GroupName
         }
     }
@@ -1871,7 +2201,10 @@ if ($FSLogixInstalled) {
                         -Finding "The include group has no members." `
                         -Recommendation "Confirm that this is intentional because no users will be included through this group."
                 }
-                elseif (Test-EveryoneMembership -Members $Members) {
+                elseif (
+                    Test-EveryoneMembership `
+                        -Members $Members
+                ) {
 
                     Add-HealthResult `
                         -Status "PASS" `
@@ -1957,9 +2290,9 @@ else {
         -Finding "Local group checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Storage connectivity, container sizing and capacity
-# ------------------------------------------------------------
+# ============================================================
 
 if ($ProfileStorageLocations.Count -gt 0) {
 
@@ -1967,15 +2300,23 @@ if ($ProfileStorageLocations.Count -gt 0) {
 
         if ($Location -match '^\\\\([^\\]+)\\(.+)$') {
 
-            $StorageHost     = $Matches[1]
-            $ShareAccessible = $false
+            $StorageHost =
+                $Matches[1]
+
+            $ShareAccessible =
+                $false
+
+            # ------------------------------------------------
+            # TCP 445
+            # ------------------------------------------------
 
             try {
 
-                $TcpResult = Test-NetConnection `
-                    -ComputerName $StorageHost `
-                    -Port 445 `
-                    -WarningAction SilentlyContinue
+                $TcpResult =
+                    Test-NetConnection `
+                        -ComputerName $StorageHost `
+                        -Port 445 `
+                        -WarningAction SilentlyContinue
 
                 if ($TcpResult.TcpTestSucceeded) {
 
@@ -2006,6 +2347,10 @@ if ($ProfileStorageLocations.Count -gt 0) {
                     -Finding "Unable to test TCP 445 connectivity to the FSLogix storage endpoint." `
                     -Evidence $_.Exception.Message
             }
+
+            # ------------------------------------------------
+            # Share reachability
+            # ------------------------------------------------
 
             try {
 
@@ -2041,13 +2386,21 @@ if ($ProfileStorageLocations.Count -gt 0) {
                     -Evidence "$Location - $($_.Exception.Message)"
             }
 
-            if ($ShareAccessible -and $EffectiveSizeInMBs -gt 0) {
+            # ------------------------------------------------
+            # Profile container file-size inventory
+            # ------------------------------------------------
+
+            if (
+                $ShareAccessible -and
+                $EffectiveSizeInMBs -gt 0
+            ) {
 
                 try {
 
-                    $ContainerScan = Get-ContainerFiles `
-                        -RootPath $Location `
-                        -MaximumFiles $MaxContainerFiles
+                    $ContainerScan =
+                        Get-ContainerFiles `
+                            -RootPath $Location `
+                            -MaximumFiles $MaxContainerFiles
 
                     $ContainerFiles = @(
                         $ContainerScan.Files
@@ -2071,15 +2424,17 @@ if ($ProfileStorageLocations.Count -gt 0) {
                             $ContainerFiles |
                             ForEach-Object {
 
-                                $SizeBytes = [double]$_.Length
+                                $SizeBytes =
+                                    [double]$_.Length
 
-                                $PercentOfMaximum = [math]::Round(
-                                    (
-                                        $SizeBytes /
-                                        $MaximumBytes
-                                    ) * 100,
-                                    2
-                                )
+                                $PercentOfMaximum =
+                                    [math]::Round(
+                                        (
+                                            $SizeBytes /
+                                            $MaximumBytes
+                                        ) * 100,
+                                        2
+                                    )
 
                                 [PSCustomObject]@{
                                     Name             = $_.Name
@@ -2101,12 +2456,16 @@ if ($ProfileStorageLocations.Count -gt 0) {
                                 $_.PercentOfMaximum -ge
                                 $ContainerWarningPercent
                             } |
-                            Sort-Object PercentOfMaximum -Descending
+                            Sort-Object `
+                                PercentOfMaximum `
+                                -Descending
                         )
 
                         $LargestContainers = @(
                             $ContainerDetails |
-                            Sort-Object SizeBytes -Descending |
+                            Sort-Object `
+                                SizeBytes `
+                                -Descending |
                             Select-Object -First 10
                         )
 
@@ -2121,13 +2480,14 @@ if ($ProfileStorageLocations.Count -gt 0) {
                             $TotalContainerBytes = 0
                         }
 
-                        $TotalContainerGiB = [math]::Round(
-                            (
-                                [double]$TotalContainerBytes /
-                                1GB
-                            ),
-                            2
-                        )
+                        $TotalContainerGiB =
+                            [math]::Round(
+                                (
+                                    [double]$TotalContainerBytes /
+                                    1GB
+                                ),
+                                2
+                            )
 
                         $LargestEvidence = (
                             $LargestContainers |
@@ -2136,12 +2496,15 @@ if ($ProfileStorageLocations.Count -gt 0) {
                             }
                         ) -join "; "
 
-                        $ScanSuffix = if ($ContainerScan.LimitReached) {
-                            " Scan stopped after $MaxContainerFiles container files because the configured audit limit was reached."
-                        }
-                        else {
-                            ""
-                        }
+                        $ScanSuffix =
+                            if ($ContainerScan.LimitReached) {
+
+                                " Scan stopped after $MaxContainerFiles container files because the configured audit limit was reached."
+                            }
+                            else {
+
+                                ""
+                            }
 
                         if ($ContainersNearLimit.Count -gt 0) {
 
@@ -2159,7 +2522,7 @@ if ($ProfileStorageLocations.Count -gt 0) {
                                 -Check "Profile container sizes" `
                                 -Finding "$($ContainersNearLimit.Count) profile container file(s) are at or above the audit warning threshold of $ContainerWarningPercent% of SizeInMBs." `
                                 -Evidence "Storage=$Location; Configured maximum=$EffectiveSizeInMBs MB; Containers scanned=$($ContainerDetails.Count); Total container file size=$TotalContainerGiB GiB; Near threshold: $NearLimitEvidence.$ScanSuffix" `
-                                -Recommendation "Review the affected containers. Do not delete profile data or increase SizeInMBs without first determining why the container is large."
+                                -Recommendation "Review the affected containers. Physical container file size approaching SizeInMBs does not by itself prove that the filesystem inside the container has little free space."
                         }
                         else {
 
@@ -2203,20 +2566,26 @@ if ($ProfileStorageLocations.Count -gt 0) {
                 '^\\\\([^.\\]+)\.file\.core\.windows\.net\\([^\\]+)'
             ) {
 
-                $AzureStorageAccountName = $Matches[1]
-                $AzureFileShareName      = $Matches[2]
+                $AzureStorageAccountName =
+                    $Matches[1]
 
-                $AzContextCommand = Get-Command `
-                    Get-AzContext `
-                    -ErrorAction SilentlyContinue
+                $AzureFileShareName =
+                    $Matches[2]
 
-                $AzStorageCommand = Get-Command `
-                    Get-AzStorageAccount `
-                    -ErrorAction SilentlyContinue
+                $AzContextCommand =
+                    Get-Command `
+                        Get-AzContext `
+                        -ErrorAction SilentlyContinue
 
-                $AzShareCommand = Get-Command `
-                    Get-AzRmStorageShare `
-                    -ErrorAction SilentlyContinue
+                $AzStorageCommand =
+                    Get-Command `
+                        Get-AzStorageAccount `
+                        -ErrorAction SilentlyContinue
+
+                $AzShareCommand =
+                    Get-Command `
+                        Get-AzRmStorageShare `
+                        -ErrorAction SilentlyContinue
 
                 if (
                     -not $AzContextCommand -or
@@ -2236,8 +2605,9 @@ if ($ProfileStorageLocations.Count -gt 0) {
 
                     try {
 
-                        $AzContext = Get-AzContext `
-                            -ErrorAction SilentlyContinue
+                        $AzContext =
+                            Get-AzContext `
+                                -ErrorAction SilentlyContinue
 
                         if (
                             $null -eq $AzContext -or
@@ -2266,7 +2636,9 @@ if ($ProfileStorageLocations.Count -gt 0) {
                                     }
                                 )
 
-                                if ($MatchingStorageAccounts.Count -eq 0) {
+                                if (
+                                    $MatchingStorageAccounts.Count -eq 0
+                                ) {
 
                                     Add-HealthResult `
                                         -Status "INFO" `
@@ -2281,12 +2653,13 @@ if ($ProfileStorageLocations.Count -gt 0) {
                                     $StorageAccount =
                                         $MatchingStorageAccounts[0]
 
-                                    $AzureShare = Get-AzRmStorageShare `
-                                        -ResourceGroupName $StorageAccount.ResourceGroupName `
-                                        -StorageAccountName $AzureStorageAccountName `
-                                        -Name $AzureFileShareName `
-                                        -GetShareUsage `
-                                        -ErrorAction Stop
+                                    $AzureShare =
+                                        Get-AzRmStorageShare `
+                                            -ResourceGroupName $StorageAccount.ResourceGroupName `
+                                            -StorageAccountName $AzureStorageAccountName `
+                                            -Name $AzureFileShareName `
+                                            -GetShareUsage `
+                                            -ErrorAction Stop
 
                                     $QuotaGiB =
                                         [double]$AzureShare.QuotaGiB
@@ -2302,33 +2675,43 @@ if ($ProfileStorageLocations.Count -gt 0) {
                                         $QuotaBytes =
                                             $QuotaGiB * 1GB
 
-                                        $FreeBytes = [math]::Max(
-                                            0,
-                                            (
-                                                $QuotaBytes -
-                                                $UsedBytes
+                                        $FreeBytes =
+                                            [math]::Max(
+                                                0,
+                                                (
+                                                    $QuotaBytes -
+                                                    $UsedBytes
+                                                )
                                             )
-                                        )
 
-                                        $UsedGiB = [math]::Round(
-                                            ($UsedBytes / 1GB),
-                                            2
-                                        )
+                                        $UsedGiB =
+                                            [math]::Round(
+                                                (
+                                                    $UsedBytes /
+                                                    1GB
+                                                ),
+                                                2
+                                            )
 
-                                        $FreeGiB = [math]::Round(
-                                            ($FreeBytes / 1GB),
-                                            2
-                                        )
-
-                                        $FreePercent = [math]::Round(
-                                            (
+                                        $FreeGiB =
+                                            [math]::Round(
                                                 (
                                                     $FreeBytes /
-                                                    $QuotaBytes
-                                                ) * 100
-                                            ),
-                                            2
-                                        )
+                                                    1GB
+                                                ),
+                                                2
+                                            )
+
+                                        $FreePercent =
+                                            [math]::Round(
+                                                (
+                                                    (
+                                                        $FreeBytes /
+                                                        $QuotaBytes
+                                                    ) * 100
+                                                ),
+                                                2
+                                            )
 
                                         if ($FreePercent -lt 20) {
 
@@ -2390,7 +2773,8 @@ if ($ProfileStorageLocations.Count -gt 0) {
                 # Traditional SMB capacity
                 # --------------------------------------------
 
-                $TemporaryDriveName = "FSLAudit"
+                $TemporaryDriveName =
+                    "FSLAudit"
 
                 try {
 
@@ -2406,16 +2790,18 @@ if ($ProfileStorageLocations.Count -gt 0) {
                             -ErrorAction SilentlyContinue
                     }
 
-                    $null = New-PSDrive `
-                        -Name $TemporaryDriveName `
-                        -PSProvider FileSystem `
-                        -Root $Location `
-                        -Scope Script `
-                        -ErrorAction Stop
+                    $null =
+                        New-PSDrive `
+                            -Name $TemporaryDriveName `
+                            -PSProvider FileSystem `
+                            -Root $Location `
+                            -Scope Script `
+                            -ErrorAction Stop
 
-                    $DriveInfo = Get-PSDrive `
-                        -Name $TemporaryDriveName `
-                        -ErrorAction Stop
+                    $DriveInfo =
+                        Get-PSDrive `
+                            -Name $TemporaryDriveName `
+                            -ErrorAction Stop
 
                     if (
                         $null -ne $DriveInfo.Free -and
@@ -2427,23 +2813,32 @@ if ($ProfileStorageLocations.Count -gt 0) {
                             [double]$DriveInfo.Free +
                             [double]$DriveInfo.Used
 
-                        $FreePercent = [math]::Round(
-                            (
-                                [double]$DriveInfo.Free /
-                                $TotalBytes
-                            ) * 100,
-                            2
-                        )
+                        $FreePercent =
+                            [math]::Round(
+                                (
+                                    [double]$DriveInfo.Free /
+                                    $TotalBytes
+                                ) * 100,
+                                2
+                            )
 
-                        $FreeGiB = [math]::Round(
-                            ([double]$DriveInfo.Free / 1GB),
-                            2
-                        )
+                        $FreeGiB =
+                            [math]::Round(
+                                (
+                                    [double]$DriveInfo.Free /
+                                    1GB
+                                ),
+                                2
+                            )
 
-                        $TotalGiB = [math]::Round(
-                            ($TotalBytes / 1GB),
-                            2
-                        )
+                        $TotalGiB =
+                            [math]::Round(
+                                (
+                                    $TotalBytes /
+                                    1GB
+                                ),
+                                2
+                            )
 
                         if ($FreePercent -lt 20) {
 
@@ -2505,6 +2900,18 @@ if ($ProfileStorageLocations.Count -gt 0) {
         }
     }
 }
+elseif (
+    $CloudCacheEnabled -and
+    $CloudCacheAzureProviders.Count -gt 0
+) {
+
+    Add-HealthResult `
+        -Status "INFO" `
+        -Category "Storage" `
+        -Check "SMB storage checks" `
+        -Finding "SMB storage checks were skipped because this Cloud Cache configuration contains no SMB provider." `
+        -Evidence "Azure Cloud Cache providers: $($CloudCacheAzureProviders.Count)"
+}
 else {
 
     Add-HealthResult `
@@ -2514,9 +2921,9 @@ else {
         -Finding "Storage checks were skipped because no usable profile storage location was available."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Microsoft Defender / Antivirus exclusions
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -2526,9 +2933,15 @@ if ($FSLogixInstalled) {
 
     try {
 
-        $DefenderPreference = Get-MpPreference -ErrorAction Stop
-        $DefenderStatus     = Get-MpComputerStatus -ErrorAction Stop
-        $DefenderAvailable  = $true
+        $DefenderPreference =
+            Get-MpPreference `
+                -ErrorAction Stop
+
+        $DefenderStatus =
+            Get-MpComputerStatus `
+                -ErrorAction Stop
+
+        $DefenderAvailable = $true
     }
     catch {
 
@@ -2583,10 +2996,12 @@ if ($FSLogixInstalled) {
                 -Recommendation "Validate FSLogix exclusions in the active antivirus product."
         }
 
-        $ExclusionsHidden = Test-DefenderExclusionsHidden `
-            -Paths $ExclusionPaths `
-            -Processes $ExclusionProcesses `
-            -Extensions $ExclusionExtensions
+        $ExclusionsHidden =
+            Test-DefenderExclusionsHidden `
+                -Preference $DefenderPreference `
+                -Paths $ExclusionPaths `
+                -Processes $ExclusionProcesses `
+                -Extensions $ExclusionExtensions
 
         if (-not $IsElevated) {
 
@@ -2604,25 +3019,32 @@ if ($FSLogixInstalled) {
                 -Status "INFO" `
                 -Category "Antivirus" `
                 -Check "FSLogix Defender exclusions" `
-                -Finding "Defender exclusions appear to be hidden from local PowerShell and could not be reliably validated." `
-                -Evidence "The exclusion data returned by Get-MpPreference contains hidden or unavailable placeholder values." `
-                -Recommendation "Validate the effective FSLogix exclusions in the Defender management policy."
+                -Finding "Defender exclusions are hidden from local PowerShell and could not be reliably validated." `
+                -Evidence "HideExclusionsFromLocalAdmins is enabled or hidden exclusion data was returned." `
+                -Recommendation "Validate the effective FSLogix exclusions in the centrally managed Defender policy."
         }
         else {
 
             $MissingExclusions =
-                New-Object System.Collections.Generic.List[string]
+                New-Object `
+                    System.Collections.Generic.List[string]
+
+            # ------------------------------------------------
+            # Processes
+            # ------------------------------------------------
 
             foreach ($RequiredProcess in @(
                 "frxsvc.exe",
                 "frxccds.exe"
             )) {
 
-                if (-not (
-                    Test-ProcessCoverage `
-                        -RequiredProcess $RequiredProcess `
-                        -ConfiguredProcesses $ExclusionProcesses
-                )) {
+                if (
+                    -not (
+                        Test-ProcessCoverage `
+                            -RequiredProcess $RequiredProcess `
+                            -ConfiguredProcesses $ExclusionProcesses
+                    )
+                ) {
 
                     $MissingExclusions.Add(
                         "Process: $RequiredProcess"
@@ -2630,17 +3052,36 @@ if ($FSLogixInstalled) {
                 }
             }
 
-            foreach ($RequiredPath in @(
+            # ------------------------------------------------
+            # Core paths
+            # ------------------------------------------------
+
+            $RequiredDefenderPaths = @(
                 "C:\Program Files\FSLogix\Apps\",
                 "C:\ProgramData\FSLogix\",
                 "C:\Users\%username%\AppData\Local\FSLogix\"
-            )) {
+            )
 
-                if (-not (
-                    Test-PathCoverage `
-                        -RequiredPath $RequiredPath `
-                        -ConfiguredPaths $ExclusionPaths
-                )) {
+            # Cloud Cache has additional Microsoft-listed
+            # Cache and Proxy paths.
+            if ($CloudCacheEnabled) {
+
+                $RequiredDefenderPaths +=
+                    "%ProgramData%\FSLogix\Cache\*"
+
+                $RequiredDefenderPaths +=
+                    "%ProgramData%\FSLogix\Proxy\*"
+            }
+
+            foreach ($RequiredPath in $RequiredDefenderPaths) {
+
+                if (
+                    -not (
+                        Test-PathCoverage `
+                            -RequiredPath $RequiredPath `
+                            -ConfiguredPaths $ExclusionPaths
+                    )
+                ) {
 
                     $MissingExclusions.Add(
                         "Path: $RequiredPath"
@@ -2648,23 +3089,33 @@ if ($FSLogixInstalled) {
                 }
             }
 
+            # ------------------------------------------------
+            # Drivers
+            # ------------------------------------------------
+
             foreach ($Driver in @(
                 "C:\Program Files\FSLogix\Apps\frxdrv.sys",
                 "C:\Program Files\FSLogix\Apps\frxdrvvt.sys",
                 "C:\Program Files\FSLogix\Apps\frxccd.sys"
             )) {
 
-                if (-not (
-                    Test-PathCoverage `
-                        -RequiredPath $Driver `
-                        -ConfiguredPaths $ExclusionPaths
-                )) {
+                if (
+                    -not (
+                        Test-PathCoverage `
+                            -RequiredPath $Driver `
+                            -ConfiguredPaths $ExclusionPaths
+                    )
+                ) {
 
                     $MissingExclusions.Add(
                         "Driver: $Driver"
                     )
                 }
             }
+
+            # ------------------------------------------------
+            # Temporary VHD/VHDX
+            # ------------------------------------------------
 
             foreach ($RequiredTempPath in @(
                 "%TEMP%\*\*.VHD",
@@ -2673,11 +3124,13 @@ if ($FSLogixInstalled) {
                 "%WINDIR%\TEMP\*\*.VHDX"
             )) {
 
-                if (-not (
-                    Test-PathCoverage `
-                        -RequiredPath $RequiredTempPath `
-                        -ConfiguredPaths $ExclusionPaths
-                )) {
+                if (
+                    -not (
+                        Test-PathCoverage `
+                            -RequiredPath $RequiredTempPath `
+                            -ConfiguredPaths $ExclusionPaths
+                    )
+                ) {
 
                     $RequiredExtension =
                         [System.IO.Path]::GetExtension(
@@ -2700,20 +3153,30 @@ if ($FSLogixInstalled) {
                 }
             }
 
+            # ------------------------------------------------
+            # SMB profile storage
+            # ------------------------------------------------
+
             foreach ($Location in $ProfileStorageLocations) {
 
-                if (-not (
-                    Test-ShareContainerCoverage `
-                        -SharePath $Location `
-                        -ConfiguredPaths $ExclusionPaths `
-                        -ConfiguredExtensions $ExclusionExtensions
-                )) {
+                if (
+                    -not (
+                        Test-ShareContainerCoverage `
+                            -SharePath $Location `
+                            -ConfiguredPaths $ExclusionPaths `
+                            -ConfiguredExtensions $ExclusionExtensions
+                    )
+                ) {
 
                     $MissingExclusions.Add(
                         "Profile storage: $Location"
                     )
                 }
             }
+
+            # ------------------------------------------------
+            # Defender result
+            # ------------------------------------------------
 
             if ($MissingExclusions.Count -eq 0) {
 
@@ -2726,7 +3189,8 @@ if ($FSLogixInstalled) {
             }
             else {
 
-                $MissingText = $MissingExclusions -join "; "
+                $MissingText =
+                    $MissingExclusions -join "; "
 
                 if ($DefenderActive) {
 
@@ -2761,14 +3225,17 @@ else {
         -Finding "Antivirus exclusion checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix event log analysis
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
-    $EventLogName = "Microsoft-FSLogix-Apps/Operational"
-    $StartTime    = (Get-Date).AddDays(-$EventLookbackDays)
+    $EventLogName =
+        "Microsoft-FSLogix-Apps/Operational"
+
+    $StartTime =
+        (Get-Date).AddDays(-$EventLookbackDays)
 
     try {
 
@@ -2793,29 +3260,35 @@ if ($FSLogixInstalled) {
         }
         else {
 
-            $ClassifiedEvents = foreach ($Event in $FSLogixErrors) {
+            $ClassifiedEvents =
+                foreach ($Event in $FSLogixErrors) {
 
-                $Classification = Get-FSLogixEventClassification `
-                    -EventId $Event.Id `
-                    -Message $Event.Message `
-                    -DomainJoined $DomainJoined `
-                    -AzureAdJoined $AzureAdJoined
+                    $Classification =
+                        Get-FSLogixEventClassification `
+                            -EventId $Event.Id `
+                            -Message $Event.Message `
+                            -DomainJoined $DomainJoined `
+                            -AzureAdJoined $AzureAdJoined
 
-                [PSCustomObject]@{
-                    Event          = $Event
-                    Classification = $Classification
+                    [PSCustomObject]@{
+                        Event          = $Event
+                        Classification = $Classification
+                    }
                 }
-            }
 
-            $Groups = $ClassifiedEvents |
+            $Groups =
+                $ClassifiedEvents |
                 Group-Object {
                     $_.Classification.Key
                 }
 
             foreach ($Group in $Groups) {
 
-                $First          = $Group.Group[0]
-                $Classification = $First.Classification
+                $First =
+                    $Group.Group[0]
+
+                $Classification =
+                    $First.Classification
 
                 $Samples = @(
                     $Group.Group |
@@ -2834,11 +3307,16 @@ if ($FSLogixInstalled) {
                         if ($CleanMessage.Length -gt 350) {
 
                             $CleanMessage =
-                                $CleanMessage.Substring(0,350) + "..."
+                                $CleanMessage.Substring(
+                                    0,
+                                    350
+                                ) + "..."
                         }
 
                         "[{0}] Event {1}: {2}" -f `
-                            $_.Event.TimeCreated.ToString("yyyy-MM-dd HH:mm"), `
+                            $_.Event.TimeCreated.ToString(
+                                "yyyy-MM-dd HH:mm"
+                            ), `
                             $_.Event.Id, `
                             $CleanMessage
                     }
@@ -2873,13 +3351,14 @@ else {
         -Finding "Event-log checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Current FSLogix session state
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
-    $SessionRoot = "HKLM:\SOFTWARE\FSLogix\Profiles\Sessions"
+    $SessionRoot =
+        "HKLM:\SOFTWARE\FSLogix\Profiles\Sessions"
 
     if (Test-Path $SessionRoot) {
 
@@ -2904,80 +3383,146 @@ if ($FSLogixInstalled) {
                 $SessionStates = @(
                     foreach ($Key in $SessionKeys) {
 
-                        $Session = Get-ItemProperty `
-                            -Path $Key.PSPath `
-                            -ErrorAction SilentlyContinue
+                        $Session =
+                            Get-ItemProperty `
+                                -Path $Key.PSPath `
+                                -ErrorAction SilentlyContinue
 
-                        $Status = 0
-                        $Reason = 0
-                        $Error  = 0
+                        $StatusValue =
+                            if ($null -ne $Session.Status) {
+                                [int]$Session.Status
+                            }
+                            else {
+                                $null
+                            }
 
-                        if ($null -ne $Session.Status) {
-                            $Status = [int]$Session.Status
-                        }
+                        $ReasonValue =
+                            if ($null -ne $Session.Reason) {
+                                [int]$Session.Reason
+                            }
+                            else {
+                                0
+                            }
 
-                        if ($null -ne $Session.Reason) {
-                            $Reason = [int]$Session.Reason
-                        }
+                        $ErrorValue =
+                            if ($null -ne $Session.Error) {
+                                [int]$Session.Error
+                            }
+                            else {
+                                0
+                            }
 
-                        if ($null -ne $Session.Error) {
-                            $Error = [int]$Session.Error
-                        }
+                        $ReasonSeverity =
+                            Get-SessionReasonSeverity `
+                                -Reason $ReasonValue
 
                         [PSCustomObject]@{
                             SID               = $Key.PSChildName
                             User              = Resolve-SidToName `
                                                     -Sid $Key.PSChildName
-                            Status            = $Status
+                            Status            = $StatusValue
                             StatusDescription = Get-SessionStatusDescription `
-                                                    -Status $Status
-                            Reason            = $Reason
-                            Error             = $Error
+                                                    -Status $StatusValue
+                            Reason            = $ReasonValue
+                            ReasonDescription = Get-SessionReasonDescription `
+                                                    -Reason $ReasonValue
+                            ReasonSeverity    = $ReasonSeverity
+                            Error             = $ErrorValue
                         }
                     }
                 )
 
-                $ProblemSessions = @(
+                # ------------------------------------------------
+                # Error-status sessions
+                # ------------------------------------------------
+
+                $ErrorSessions = @(
                     $SessionStates |
                     Where-Object {
+
                         (
+                            $null -ne $_.Status -and
                             $_.Status -ge 1 -and
                             $_.Status -le 28
                         ) -or
-                        $_.Reason -ne 0 -or
                         $_.Error -ne 0
                     }
                 )
 
+                # ------------------------------------------------
+                # Reason values considered actionable warnings
+                # ------------------------------------------------
+
+                $WarningReasonSessions = @(
+                    $SessionStates |
+                    Where-Object {
+                        $_.ReasonSeverity -eq "WARN" -and
+                        -not (
+                            (
+                                $null -ne $_.Status -and
+                                $_.Status -ge 1 -and
+                                $_.Status -le 28
+                            ) -or
+                            $_.Error -ne 0
+                        )
+                    }
+                )
+
+                # ------------------------------------------------
+                # Normal reason conditions
+                # ------------------------------------------------
+
+                $InformationalReasonSessions = @(
+                    $SessionStates |
+                    Where-Object {
+                        $_.ReasonSeverity -eq "INFO" -and
+                        $_.Reason -ne 0
+                    }
+                )
+
+                # ------------------------------------------------
+                # Normal intermediate/attached status values
+                # ------------------------------------------------
+
                 $TransitionSessions = @(
                     $SessionStates |
                     Where-Object {
-                        (
-                            $_.Status -eq 100 -or
-                            $_.Status -eq 200
-                        ) -and
+                        $_.Status -in @(100,200,300) -and
                         $_.Reason -eq 0 -and
                         $_.Error -eq 0
                     }
                 )
 
+                # ------------------------------------------------
+                # Missing / unknown statuses
+                # ------------------------------------------------
+
                 $UnknownSessions = @(
                     $SessionStates |
                     Where-Object {
-                        $_.Status -notin @(0,100,200,300) -and
-                        -not (
-                            $_.Status -ge 1 -and
-                            $_.Status -le 28
+
+                        $null -eq $_.Status -or
+                        (
+                            $_.Status -notin @(0,100,200,300) -and
+                            -not (
+                                $_.Status -ge 1 -and
+                                $_.Status -le 28
+                            )
                         )
                     }
                 )
 
-                if ($ProblemSessions.Count -gt 0) {
+                # ------------------------------------------------
+                # Final session classification
+                # ------------------------------------------------
+
+                if ($ErrorSessions.Count -gt 0) {
 
                     $SessionEvidence = (
-                        $ProblemSessions |
+                        $ErrorSessions |
                         ForEach-Object {
-                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason), Error=$($_.Error)"
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
                         }
                     ) -join "; "
 
@@ -2985,16 +3530,35 @@ if ($FSLogixInstalled) {
                         -Status "WARN" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
-                        -Finding "$($ProblemSessions.Count) FSLogix session(s) have an error status, non-zero Reason, or non-zero Error value." `
+                        -Finding "$($ErrorSessions.Count) FSLogix session(s) contain an error status or non-zero Error value." `
                         -Evidence $SessionEvidence `
-                        -Recommendation "Review the affected session against the FSLogix profile logs and Microsoft FSLogix status, reason and error code documentation."
+                        -Recommendation "Review the affected session against the FSLogix profile logs and Microsoft FSLogix status, reason and error-code documentation."
+                }
+                elseif ($WarningReasonSessions.Count -gt 0) {
+
+                    $SessionEvidence = (
+                        $WarningReasonSessions |
+                        ForEach-Object {
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
+                        }
+                    ) -join "; "
+
+                    Add-HealthResult `
+                        -Status "WARN" `
+                        -Category "Runtime" `
+                        -Check "Session attach status" `
+                        -Finding "$($WarningReasonSessions.Count) FSLogix session(s) contain a Reason value that may indicate a profile problem." `
+                        -Evidence $SessionEvidence `
+                        -Recommendation "Review the affected user's local profile state and FSLogix logs."
                 }
                 elseif ($UnknownSessions.Count -gt 0) {
 
                     $SessionEvidence = (
                         $UnknownSessions |
                         ForEach-Object {
-                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason), Error=$($_.Error)"
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
                         }
                     ) -join "; "
 
@@ -3002,16 +3566,34 @@ if ($FSLogixInstalled) {
                         -Status "INFO" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
-                        -Finding "$($UnknownSessions.Count) FSLogix session(s) contain a status value not currently classified by the audit." `
+                        -Finding "$($UnknownSessions.Count) FSLogix session(s) contain a missing or currently unclassified Status value." `
                         -Evidence $SessionEvidence `
                         -Recommendation "Review the status against the FSLogix logs if the user is experiencing a profile issue."
+                }
+                elseif ($InformationalReasonSessions.Count -gt 0) {
+
+                    $SessionEvidence = (
+                        $SessionStates |
+                        ForEach-Object {
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
+                        }
+                    ) -join "; "
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Runtime" `
+                        -Check "Session attach status" `
+                        -Finding "FSLogix session state contains a non-error Reason condition." `
+                        -Evidence $SessionEvidence
                 }
                 elseif ($TransitionSessions.Count -gt 0) {
 
                     $SessionEvidence = (
                         $SessionStates |
                         ForEach-Object {
-                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason), Error=$($_.Error)"
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
                         }
                     ) -join "; "
 
@@ -3019,7 +3601,7 @@ if ($FSLogixInstalled) {
                         -Status "INFO" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
-                        -Finding "FSLogix session state is healthy, with one or more sessions currently in a normal loading or unloading transition." `
+                        -Finding "FSLogix session state contains a normal setup or already-attached status." `
                         -Evidence $SessionEvidence
                 }
                 else {
@@ -3027,7 +3609,8 @@ if ($FSLogixInstalled) {
                     $SessionEvidence = (
                         $SessionStates |
                         ForEach-Object {
-                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason), Error=$($_.Error)"
+
+                            "$($_.User) [$($_.SID)]: Status=$($_.Status) ($($_.StatusDescription)), Reason=$($_.Reason) ($($_.ReasonDescription)), Error=$($_.Error)"
                         }
                     ) -join "; "
 
@@ -3035,7 +3618,7 @@ if ($FSLogixInstalled) {
                         -Status "PASS" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
-                        -Finding "FSLogix session state contains no detected error, reason or transition conditions requiring review." `
+                        -Finding "FSLogix session state contains no detected error or actionable reason condition." `
                         -Evidence $SessionEvidence
                 }
             }
@@ -3068,9 +3651,9 @@ else {
         -Finding "Session checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Temporary and orphaned profiles
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -3125,9 +3708,14 @@ if ($FSLogixInstalled) {
 
                 $EvidenceParts += (
                     "ProfileList .bak keys: " +
-                    (($BakKeys | ForEach-Object {
-                        $_.PSChildName
-                    }) -join ", ")
+                    (
+                        (
+                            $BakKeys |
+                            ForEach-Object {
+                                $_.PSChildName
+                            }
+                        ) -join ", "
+                    )
                 )
             }
 
@@ -3135,9 +3723,14 @@ if ($FSLogixInstalled) {
 
                 $EvidenceParts += (
                     "TEMP profile folders: " +
-                    (($TempFolders | ForEach-Object {
-                        $_.FullName
-                    }) -join ", ")
+                    (
+                        (
+                            $TempFolders |
+                            ForEach-Object {
+                                $_.FullName
+                            }
+                        ) -join ", "
+                    )
                 )
             }
 
@@ -3169,9 +3762,9 @@ else {
         -Finding "Profile-state checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Local profile inventory
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
@@ -3230,28 +3823,33 @@ else {
         -Finding "Local profile inventory was skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # FSLogix text logging
-# ------------------------------------------------------------
+# ============================================================
 
 if ($FSLogixInstalled) {
 
     try {
 
-        $LoggingRegPath = "HKLM:\SOFTWARE\FSLogix\Logging"
-        $LogDir         = "C:\ProgramData\FSLogix\Logs"
+        $LoggingRegPath =
+            "HKLM:\SOFTWARE\FSLogix\Logging"
+
+        $LogDir =
+            "C:\ProgramData\FSLogix\Logs"
 
         if (Test-Path $LoggingRegPath) {
 
-            $LoggingConfig = Get-ItemProperty `
-                -Path $LoggingRegPath `
-                -ErrorAction SilentlyContinue
+            $LoggingConfig =
+                Get-ItemProperty `
+                    -Path $LoggingRegPath `
+                    -ErrorAction SilentlyContinue
 
             if ($LoggingConfig.LogDir) {
 
-                $LogDir = [Environment]::ExpandEnvironmentVariables(
-                    [string]$LoggingConfig.LogDir
-                )
+                $LogDir =
+                    [Environment]::ExpandEnvironmentVariables(
+                        [string]$LoggingConfig.LogDir
+                    )
             }
         }
 
@@ -3266,7 +3864,9 @@ if ($FSLogixInstalled) {
                     -ErrorAction SilentlyContinue |
                 Where-Object {
                     $_.LastWriteTime -ge
-                    (Get-Date).AddDays(-$EventLookbackDays)
+                    (Get-Date).AddDays(
+                        -$EventLookbackDays
+                    )
                 }
             )
 
@@ -3319,9 +3919,9 @@ else {
         -Finding "Logging checks were skipped because FSLogix is not installed."
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Result totals
-# ------------------------------------------------------------
+# ============================================================
 
 $PassCount = @(
     $Results |
@@ -3352,95 +3952,122 @@ $InfoCount = @(
 # ------------------------------------------------------------
 
 if ($FailCount -gt 0) {
+
     $AuditExitCode = 2
 }
 elseif ($WarnCount -gt 0) {
+
     $AuditExitCode = 1
 }
 else {
+
     $AuditExitCode = 0
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # JSON output
-# ------------------------------------------------------------
+# ============================================================
 
-$JsonFile = Join-Path `
-    $ReportPath `
-    "FSLogix-Health-Audit-$ComputerName-$Timestamp.json"
+$JsonFile =
+    Join-Path `
+        $ReportPath `
+        "FSLogix-Health-Audit-$ComputerName-$Timestamp.json"
 
-$JsonOutput = [PSCustomObject]@{
-    ScriptVersion = $ScriptVersion
-    ComputerName  = $ComputerName
-    Generated     = $Generated
+$JsonOutput =
+    [PSCustomObject]@{
 
-    ExecutionContext = [PSCustomObject]@{
-        Identity          = $RunAsIdentity
-        Elevated          = $IsElevated
-        PowerShellVersion = $PowerShellVersion
-        PowerShellEdition = $PowerShellEdition
+        ScriptVersion = $ScriptVersion
+        ComputerName  = $ComputerName
+        Generated     = $Generated
+
+        ExecutionContext =
+            [PSCustomObject]@{
+
+                Identity          = $RunAsIdentity
+                Elevated          = $IsElevated
+                PowerShellVersion = $PowerShellVersion
+                PowerShellEdition = $PowerShellEdition
+            }
+
+        AuditParameters =
+            [PSCustomObject]@{
+
+                ReportPath              = $ReportPath
+                EventLookbackDays       = $EventLookbackDays
+                ContainerWarningPercent = $ContainerWarningPercent
+                MaxContainerFiles       = $MaxContainerFiles
+                NonInteractive          = [bool]$NonInteractive
+            }
+
+        Summary =
+            [PSCustomObject]@{
+
+                Pass     = $PassCount
+                Warn     = $WarnCount
+                Fail     = $FailCount
+                Info     = $InfoCount
+                ExitCode = $AuditExitCode
+            }
+
+        Results = $Results
     }
-
-    AuditParameters = [PSCustomObject]@{
-        ReportPath              = $ReportPath
-        EventLookbackDays       = $EventLookbackDays
-        ContainerWarningPercent = $ContainerWarningPercent
-        MaxContainerFiles       = $MaxContainerFiles
-        NonInteractive          = [bool]$NonInteractive
-    }
-
-    Summary = [PSCustomObject]@{
-        Pass     = $PassCount
-        Warn     = $WarnCount
-        Fail     = $FailCount
-        Info     = $InfoCount
-        ExitCode = $AuditExitCode
-    }
-
-    Results = $Results
-}
 
 $JsonOutput |
     ConvertTo-Json -Depth 7 |
-    Set-Content -Path $JsonFile -Encoding UTF8
+    Set-Content `
+        -Path $JsonFile `
+        -Encoding UTF8
 
-# ------------------------------------------------------------
+# ============================================================
 # HTML output
-# ------------------------------------------------------------
+# ============================================================
 
-$HtmlFile = Join-Path `
-    $ReportPath `
-    "FSLogix-Health-Audit-$ComputerName-$Timestamp.html"
+$HtmlFile =
+    Join-Path `
+        $ReportPath `
+        "FSLogix-Health-Audit-$ComputerName-$Timestamp.html"
 
-$HtmlRows = foreach ($Result in $Results) {
+$HtmlRows =
+    foreach ($Result in $Results) {
 
-    switch ($Result.Status) {
+        switch ($Result.Status) {
 
-        "PASS" {
-            $StatusClass = "pass"
+            "PASS" {
+                $StatusClass = "pass"
+            }
+
+            "WARN" {
+                $StatusClass = "warn"
+            }
+
+            "FAIL" {
+                $StatusClass = "fail"
+            }
+
+            default {
+                $StatusClass = "info"
+            }
         }
 
-        "WARN" {
-            $StatusClass = "warn"
-        }
+        $SafeCategory =
+            ConvertTo-HtmlSafe $Result.Category
 
-        "FAIL" {
-            $StatusClass = "fail"
-        }
+        $SafeStatus =
+            ConvertTo-HtmlSafe $Result.Status
 
-        default {
-            $StatusClass = "info"
-        }
-    }
+        $SafeCheck =
+            ConvertTo-HtmlSafe $Result.Check
 
-    $SafeCategory       = ConvertTo-HtmlSafe $Result.Category
-    $SafeStatus         = ConvertTo-HtmlSafe $Result.Status
-    $SafeCheck          = ConvertTo-HtmlSafe $Result.Check
-    $SafeFinding        = ConvertTo-HtmlSafe $Result.Finding
-    $SafeEvidence       = ConvertTo-HtmlSafe $Result.Evidence
-    $SafeRecommendation = ConvertTo-HtmlSafe $Result.Recommendation
+        $SafeFinding =
+            ConvertTo-HtmlSafe $Result.Finding
 
-    @"
+        $SafeEvidence =
+            ConvertTo-HtmlSafe $Result.Evidence
+
+        $SafeRecommendation =
+            ConvertTo-HtmlSafe $Result.Recommendation
+
+@"
 <tr class="$StatusClass">
     <td>$SafeCategory</td>
     <td><strong>$SafeStatus</strong></td>
@@ -3450,21 +4077,35 @@ $HtmlRows = foreach ($Result in $Results) {
     <td>$SafeRecommendation</td>
 </tr>
 "@
-}
+    }
 
-$SafeComputerName    = ConvertTo-HtmlSafe $ComputerName
-$SafeGenerated       = ConvertTo-HtmlSafe $Generated
-$SafeVersion         = ConvertTo-HtmlSafe $ScriptVersion
-$SafeReportPath      = ConvertTo-HtmlSafe $ReportPath
-$SafeRunAsIdentity   = ConvertTo-HtmlSafe $RunAsIdentity
-$SafePSEdition       = ConvertTo-HtmlSafe $PowerShellEdition
-$SafePSVersion       = ConvertTo-HtmlSafe $PowerShellVersion
+$SafeComputerName =
+    ConvertTo-HtmlSafe $ComputerName
+
+$SafeGenerated =
+    ConvertTo-HtmlSafe $Generated
+
+$SafeVersion =
+    ConvertTo-HtmlSafe $ScriptVersion
+
+$SafeReportPath =
+    ConvertTo-HtmlSafe $ReportPath
+
+$SafeRunAsIdentity =
+    ConvertTo-HtmlSafe $RunAsIdentity
+
+$SafePSEdition =
+    ConvertTo-HtmlSafe $PowerShellEdition
+
+$SafePSVersion =
+    ConvertTo-HtmlSafe $PowerShellVersion
 
 $Html = @"
 <!DOCTYPE html>
 <html lang="en">
 
 <head>
+
 <meta charset="utf-8">
 
 <title>FSLogix Health Audit - $SafeComputerName</title>
@@ -3564,6 +4205,7 @@ td {
 }
 
 </style>
+
 </head>
 
 <body>
@@ -3630,15 +4272,18 @@ $($HtmlRows -join "`n")
 </table>
 
 </body>
+
 </html>
 "@
 
 $Html |
-    Set-Content -Path $HtmlFile -Encoding UTF8
+    Set-Content `
+        -Path $HtmlFile `
+        -Encoding UTF8
 
-# ------------------------------------------------------------
+# ============================================================
 # Console output
-# ------------------------------------------------------------
+# ============================================================
 
 Write-Host ""
 Write-Host "FSLogix Health Audit"
@@ -3667,11 +4312,16 @@ Write-Host ""
 
 $Results |
     Sort-Object Category, Check |
-    Format-Table Category, Status, Check, Finding -AutoSize
+    Format-Table `
+        Category, `
+        Status, `
+        Check, `
+        Finding `
+        -AutoSize
 
-# ------------------------------------------------------------
-# Return automation-friendly result
-# ------------------------------------------------------------
+# ============================================================
+# Automation-friendly exit code
+# ============================================================
 
 [Environment]::ExitCode = $AuditExitCode
 
