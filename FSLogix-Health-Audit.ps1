@@ -77,7 +77,6 @@ if (-not $NonInteractive) {
     Write-Host " - FSLogix event logs and text logs"
     Write-Host " - Current FSLogix session/profile state"
     Write-Host " - Active Directory and DNS connectivity"
-    Write-Host " - Azure Files capacity if Azure PowerShell is already authenticated"
     Write-Host ""
     Write-Host "No configuration changes, profile deletions, service restarts,"
     Write-Host "storage modifications, container mounts, or Azure sign-in actions are performed."
@@ -1770,13 +1769,6 @@ if (Test-Path $ProfilesRegPath) {
         $EffectiveSizeInMBs =
             [double]$SizeInMBs.Value
 
-        Add-HealthResult `
-            -Status "INFO" `
-            -Category "Configuration" `
-            -Check "Profile container maximum size" `
-            -Finding "The effective profile container maximum size is $($SizeInMBs.Value) MB." `
-            -Evidence "SizeInMBs=$($SizeInMBs.Value); Configured=$($SizeInMBs.Configured)"
-
         $VolumeType =
             Get-EffectiveProfileSetting `
                 -ProfileConfig $ProfileConfig `
@@ -2558,220 +2550,16 @@ if ($ProfileStorageLocations.Count -gt 0) {
             }
 
             # ------------------------------------------------
-            # Azure Files capacity
+            # Traditional SMB capacity
+            #
+            # Skipped for Azure Files shares. The audit does not
+            # authenticate to Azure, so share quota is not queried.
             # ------------------------------------------------
 
             if (
-                $Location -match
-                '^\\\\([^.\\]+)\.file\.core\.windows\.net\\([^\\]+)'
+                $Location -notmatch
+                '^\\\\[^.\\]+\.file\.core\.windows\.net\\'
             ) {
-
-                $AzureStorageAccountName =
-                    $Matches[1]
-
-                $AzureFileShareName =
-                    $Matches[2]
-
-                $AzContextCommand =
-                    Get-Command `
-                        Get-AzContext `
-                        -ErrorAction SilentlyContinue
-
-                $AzStorageCommand =
-                    Get-Command `
-                        Get-AzStorageAccount `
-                        -ErrorAction SilentlyContinue
-
-                $AzShareCommand =
-                    Get-Command `
-                        Get-AzRmStorageShare `
-                        -ErrorAction SilentlyContinue
-
-                if (
-                    -not $AzContextCommand -or
-                    -not $AzStorageCommand -or
-                    -not $AzShareCommand
-                ) {
-
-                    Add-HealthResult `
-                        -Status "INFO" `
-                        -Category "Storage" `
-                        -Check "Azure Files capacity" `
-                        -Finding "Azure Files capacity was not checked because the required Azure PowerShell modules are not available." `
-                        -Evidence "$AzureStorageAccountName / $AzureFileShareName" `
-                        -Recommendation "Capacity can be checked automatically when Az.Accounts and Az.Storage are installed and an Azure session already exists."
-                }
-                else {
-
-                    try {
-
-                        $AzContext =
-                            Get-AzContext `
-                                -ErrorAction SilentlyContinue
-
-                        if (
-                            $null -eq $AzContext -or
-                            $null -eq $AzContext.Account -or
-                            $null -eq $AzContext.Subscription
-                        ) {
-
-                            Add-HealthResult `
-                                -Status "INFO" `
-                                -Category "Storage" `
-                                -Check "Azure Files capacity" `
-                                -Finding "Azure Files capacity was not checked because no authenticated Azure PowerShell context exists." `
-                                -Evidence "$AzureStorageAccountName / $AzureFileShareName" `
-                                -Recommendation "The audit does not initiate Azure authentication. If capacity data is required, authenticate to the appropriate Azure subscription before running the audit."
-                        }
-                        else {
-
-                            try {
-
-                                $MatchingStorageAccounts = @(
-                                    Get-AzStorageAccount `
-                                        -ErrorAction Stop |
-                                    Where-Object {
-                                        $_.StorageAccountName -eq
-                                        $AzureStorageAccountName
-                                    }
-                                )
-
-                                if (
-                                    $MatchingStorageAccounts.Count -eq 0
-                                ) {
-
-                                    Add-HealthResult `
-                                        -Status "INFO" `
-                                        -Category "Storage" `
-                                        -Check "Azure Files capacity" `
-                                        -Finding "The Azure storage account could not be found in the current Azure subscription." `
-                                        -Evidence "Storage account: $AzureStorageAccountName; Subscription: $($AzContext.Subscription.Name)" `
-                                        -Recommendation "Confirm that the current Azure context has access to the subscription containing this storage account."
-                                }
-                                else {
-
-                                    $StorageAccount =
-                                        $MatchingStorageAccounts[0]
-
-                                    $AzureShare =
-                                        Get-AzRmStorageShare `
-                                            -ResourceGroupName $StorageAccount.ResourceGroupName `
-                                            -StorageAccountName $AzureStorageAccountName `
-                                            -Name $AzureFileShareName `
-                                            -GetShareUsage `
-                                            -ErrorAction Stop
-
-                                    $QuotaGiB =
-                                        [double]$AzureShare.QuotaGiB
-
-                                    $UsedBytes =
-                                        [double]$AzureShare.ShareUsageBytes
-
-                                    if (
-                                        $QuotaGiB -gt 0 -and
-                                        $UsedBytes -ge 0
-                                    ) {
-
-                                        $QuotaBytes =
-                                            $QuotaGiB * 1GB
-
-                                        $FreeBytes =
-                                            [math]::Max(
-                                                0,
-                                                (
-                                                    $QuotaBytes -
-                                                    $UsedBytes
-                                                )
-                                            )
-
-                                        $UsedGiB =
-                                            [math]::Round(
-                                                (
-                                                    $UsedBytes /
-                                                    1GB
-                                                ),
-                                                2
-                                            )
-
-                                        $FreeGiB =
-                                            [math]::Round(
-                                                (
-                                                    $FreeBytes /
-                                                    1GB
-                                                ),
-                                                2
-                                            )
-
-                                        $FreePercent =
-                                            [math]::Round(
-                                                (
-                                                    (
-                                                        $FreeBytes /
-                                                        $QuotaBytes
-                                                    ) * 100
-                                                ),
-                                                2
-                                            )
-
-                                        if ($FreePercent -lt 20) {
-
-                                            Add-HealthResult `
-                                                -Status "WARN" `
-                                                -Category "Storage" `
-                                                -Check "Azure Files capacity" `
-                                                -Finding "The Azure file share has less than 20% free capacity remaining." `
-                                                -Evidence "Share=$AzureFileShareName; Used=$UsedGiB GiB; Free=$FreeGiB GiB; Quota=$QuotaGiB GiB; Free=$FreePercent%" `
-                                                -Recommendation "Review Azure Files capacity and projected FSLogix profile growth."
-                                        }
-                                        else {
-
-                                            Add-HealthResult `
-                                                -Status "PASS" `
-                                                -Category "Storage" `
-                                                -Check "Azure Files capacity" `
-                                                -Finding "The Azure file share has at least 20% free capacity remaining." `
-                                                -Evidence "Share=$AzureFileShareName; Used=$UsedGiB GiB; Free=$FreeGiB GiB; Quota=$QuotaGiB GiB; Free=$FreePercent%"
-                                        }
-                                    }
-                                    else {
-
-                                        Add-HealthResult `
-                                            -Status "INFO" `
-                                            -Category "Storage" `
-                                            -Check "Azure Files capacity" `
-                                            -Finding "Azure Files capacity information was returned but could not be evaluated." `
-                                            -Evidence "QuotaGiB=$($AzureShare.QuotaGiB); ShareUsageBytes=$($AzureShare.ShareUsageBytes)"
-                                    }
-                                }
-                            }
-                            catch {
-
-                                Add-HealthResult `
-                                    -Status "INFO" `
-                                    -Category "Storage" `
-                                    -Check "Azure Files capacity" `
-                                    -Finding "Azure Files capacity could not be queried using the current Azure context." `
-                                    -Evidence $_.Exception.Message `
-                                    -Recommendation "Confirm that the current Azure account has permission to read the storage account and file share."
-                            }
-                        }
-                    }
-                    catch {
-
-                        Add-HealthResult `
-                            -Status "INFO" `
-                            -Category "Storage" `
-                            -Check "Azure Files capacity" `
-                            -Finding "Unable to determine whether an Azure PowerShell session is available." `
-                            -Evidence $_.Exception.Message
-                    }
-                }
-            }
-            else {
-
-                # --------------------------------------------
-                # Traditional SMB capacity
-                # --------------------------------------------
 
                 $TemporaryDriveName =
                     "FSLAudit"
