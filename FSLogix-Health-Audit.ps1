@@ -13,7 +13,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "0.9.2"
+$ScriptVersion = "0.9.3"
 
 # ------------------------------------------------------------
 # Execution metadata
