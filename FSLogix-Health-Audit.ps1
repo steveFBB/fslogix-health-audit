@@ -4012,12 +4012,6 @@ $($CategoryRows -join "`n")
 "@
     }
 
-# Dim summary boxes with a zero count so non-zero results stand out.
-$PassZeroClass = if ($PassCount -eq 0) { " zero" } else { "" }
-$WarnZeroClass = if ($WarnCount -eq 0) { " zero" } else { "" }
-$FailZeroClass = if ($FailCount -eq 0) { " zero" } else { "" }
-$InfoZeroClass = if ($InfoCount -eq 0) { " zero" } else { "" }
-
 $SafeComputerName =
     ConvertTo-HtmlSafe $ComputerName
 
@@ -4241,22 +4235,22 @@ Audit version: $SafeVersion
 
 <div class="summary">
 
-<div class="summary-box pass$PassZeroClass">
+<div class="summary-box pass">
     <div class="summary-number">$PassCount</div>
     <div class="summary-label">PASS</div>
 </div>
 
-<div class="summary-box warn$WarnZeroClass">
+<div class="summary-box warn">
     <div class="summary-number">$WarnCount</div>
     <div class="summary-label">WARN</div>
 </div>
 
-<div class="summary-box fail$FailZeroClass">
+<div class="summary-box fail">
     <div class="summary-number">$FailCount</div>
     <div class="summary-label">FAIL</div>
 </div>
 
-<div class="summary-box info$InfoZeroClass">
+<div class="summary-box info">
     <div class="summary-number">$InfoCount</div>
     <div class="summary-label">INFO</div>
 </div>
