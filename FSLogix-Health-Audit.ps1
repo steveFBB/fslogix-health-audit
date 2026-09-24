@@ -6,6 +6,55 @@ param (
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------
+# Startup confirmation
+# ------------------------------------------------------------
+
+Clear-Host
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host "             FSLogix Health Audit             " -ForegroundColor Cyan
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "This script performs a read-only health audit of the local FSLogix environment."
+Write-Host ""
+Write-Host "The audit may query:"
+Write-Host " - Local registry settings"
+Write-Host " - FSLogix services and drivers"
+Write-Host " - Local FSLogix groups"
+Write-Host " - Profile storage connectivity"
+Write-Host " - Microsoft Defender configuration"
+Write-Host " - FSLogix event logs and text logs"
+Write-Host " - Current FSLogix session/profile state"
+Write-Host ""
+Write-Host "No configuration changes, profile deletions, service restarts,"
+Write-Host "or storage modifications are performed."
+Write-Host ""
+
+$Choice = Read-Host "Do you want to run the audit? [R] Run  [Q] Quit"
+
+switch ($Choice.ToUpperInvariant()) {
+
+    "R" {
+        Write-Host ""
+        Write-Host "Starting FSLogix Health Audit..." -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    "Q" {
+        Write-Host ""
+        Write-Host "Audit cancelled."
+        return
+    }
+
+    default {
+        Write-Host ""
+        Write-Host "Invalid selection. Audit cancelled."
+        return
+    }
+}
+
+# ------------------------------------------------------------
 # Initial setup
 # ------------------------------------------------------------
 
@@ -201,6 +250,65 @@ function Test-ShareContainerCoverage {
     return $true
 }
 
+function Get-LocalGroupMemberNames {
+    param (
+        [Parameter(Mandatory)]
+        [string]$GroupName
+    )
+
+    try {
+
+        return @(
+            Get-LocalGroupMember `
+                -Group $GroupName `
+                -ErrorAction Stop |
+            ForEach-Object {
+                $_.Name
+            }
+        )
+    }
+    catch {
+
+        try {
+
+            $Group = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+
+            return @(
+                @($Group.psbase.Invoke("Members")) |
+                ForEach-Object {
+
+                    $_.GetType().InvokeMember(
+                        "Name",
+                        "GetProperty",
+                        $null,
+                        $_,
+                        $null
+                    )
+                }
+            )
+        }
+        catch {
+            throw
+        }
+    }
+}
+
+function Test-EveryoneMembership {
+    param (
+        [AllowEmptyCollection()]
+        [string[]]$Members = @()
+    )
+
+    foreach ($Member in $Members) {
+
+        if ($Member -match '(?i)(^|\\)everyone$') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Get-FSLogixEventClassification {
     param (
         [Parameter(Mandatory)]
@@ -220,6 +328,7 @@ function Get-FSLogixEventClassification {
         $MessageLower -match "shsetknownfolderpath" -and
         $MessageLower -match "access denied"
     ) {
+
         return [PSCustomObject]@{
             Key            = "Event26-KnownFolderAccessDenied"
             Status         = "WARN"
@@ -282,6 +391,7 @@ $DomainJoined  = $false
 $AzureAdJoined = $false
 
 try {
+
     $OS = Get-CimInstance Win32_OperatingSystem
 
     Add-HealthResult `
@@ -292,6 +402,7 @@ try {
         -Evidence "Version $($OS.Version), Build $($OS.BuildNumber)"
 }
 catch {
+
     Add-HealthResult `
         -Status "WARN" `
         -Category "Host" `
@@ -301,6 +412,7 @@ catch {
 }
 
 try {
+
     $ComputerSystem = Get-CimInstance Win32_ComputerSystem
     $DomainJoined = [bool]$ComputerSystem.PartOfDomain
 
@@ -311,6 +423,7 @@ try {
     }
 
     $JoinDescription = switch ($true) {
+
         { $DomainJoined -and $AzureAdJoined } {
             "Hybrid joined"
             break
@@ -339,6 +452,7 @@ try {
         -Evidence "DomainJoined=$DomainJoined; AzureAdJoined=$AzureAdJoined"
 }
 catch {
+
     Add-HealthResult `
         -Status "INFO" `
         -Category "Host" `
@@ -558,6 +672,120 @@ if (Test-Path $ProfilesRegPath) {
                 -Evidence "Current value: $($ProfileConfig.PreventLoginWithTempProfile)" `
                 -Recommendation "Review whether temporary-profile sign-ins should be blocked."
         }
+
+        # ----------------------------------------------------
+        # Optional redirections.xml validation
+        # ----------------------------------------------------
+
+        if (
+            $null -ne $ProfileConfig.RedirXMLSourceFolder -and
+            -not [string]::IsNullOrWhiteSpace(
+                [string]$ProfileConfig.RedirXMLSourceFolder
+            )
+        ) {
+
+            $RedirSource = [Environment]::ExpandEnvironmentVariables(
+                [string]$ProfileConfig.RedirXMLSourceFolder
+            )
+
+            $RedirSource = $RedirSource.TrimEnd('\')
+
+            $RedirFile = Join-Path `
+                $RedirSource `
+                "redirections.xml"
+
+            try {
+
+                if (-not (Test-Path -LiteralPath $RedirSource)) {
+
+                    Add-HealthResult `
+                        -Status "WARN" `
+                        -Category "Configuration" `
+                        -Check "redirections.xml source" `
+                        -Finding "RedirXMLSourceFolder is configured, but the source folder could not be reached." `
+                        -Evidence $RedirSource `
+                        -Recommendation "Verify the source path and that users/session hosts have read access."
+                }
+                elseif (-not (
+                    Test-Path `
+                        -LiteralPath $RedirFile `
+                        -PathType Leaf
+                )) {
+
+                    Add-HealthResult `
+                        -Status "FAIL" `
+                        -Category "Configuration" `
+                        -Check "redirections.xml" `
+                        -Finding "RedirXMLSourceFolder is configured but redirections.xml was not found." `
+                        -Evidence $RedirFile `
+                        -Recommendation "Place a valid file named redirections.xml in the configured source folder or remove RedirXMLSourceFolder if custom redirections are no longer required."
+                }
+                else {
+
+                    try {
+
+                        [xml]$RedirXml = Get-Content `
+                            -LiteralPath $RedirFile `
+                            -Raw `
+                            -ErrorAction Stop
+
+                        if (
+                            $null -eq
+                            $RedirXml.FrxProfileFolderRedirection
+                        ) {
+
+                            Add-HealthResult `
+                                -Status "FAIL" `
+                                -Category "Configuration" `
+                                -Check "redirections.xml" `
+                                -Finding "redirections.xml is readable XML but does not contain the expected FSLogix root element." `
+                                -Evidence $RedirFile `
+                                -Recommendation "Review the structure of redirections.xml."
+                        }
+                        else {
+
+                            $ExcludeCount = @(
+                                $RedirXml.FrxProfileFolderRedirection.Excludes.Exclude
+                            ).Count
+
+                            $IncludeCount = @(
+                                $RedirXml.FrxProfileFolderRedirection.Includes.Include
+                            ).Count
+
+                            $ExcludeCommonFolders =
+                                $RedirXml.FrxProfileFolderRedirection.ExcludeCommonFolders
+
+                            Add-HealthResult `
+                                -Status "PASS" `
+                                -Category "Configuration" `
+                                -Check "redirections.xml" `
+                                -Finding "Configured redirections.xml exists and contains valid XML." `
+                                -Evidence "Source: $RedirFile; Excludes=$ExcludeCount; Includes=$IncludeCount; ExcludeCommonFolders=$ExcludeCommonFolders"
+                        }
+                    }
+                    catch {
+
+                        Add-HealthResult `
+                            -Status "FAIL" `
+                            -Category "Configuration" `
+                            -Check "redirections.xml" `
+                            -Finding "redirections.xml exists but could not be parsed as valid XML." `
+                            -Evidence "$RedirFile - $($_.Exception.Message)" `
+                            -Recommendation "Correct the XML syntax before using the file."
+                    }
+                }
+            }
+            catch {
+
+                Add-HealthResult `
+                    -Status "WARN" `
+                    -Category "Configuration" `
+                    -Check "redirections.xml" `
+                    -Finding "Unable to validate the configured redirections.xml source." `
+                    -Evidence "$RedirFile - $($_.Exception.Message)" `
+                    -Recommendation "Verify the configured source and permissions."
+            }
+        }
     }
     catch {
 
@@ -576,6 +804,296 @@ else {
         -Category "Configuration" `
         -Check "Profile Container configuration" `
         -Finding "FSLogix Profiles registry configuration was not found."
+}
+
+# ------------------------------------------------------------
+# FSLogix minifilter drivers
+# ------------------------------------------------------------
+
+if ($FSLogixInstalled) {
+
+    $DriverFiles = @(
+        "frxdrv.sys",
+        "frxdrvvt.sys",
+        "frxccd.sys"
+    )
+
+    $MissingDriverFiles = @()
+
+    foreach ($DriverFile in $DriverFiles) {
+
+        $DriverPath = Join-Path $FSLogixPath $DriverFile
+
+        if (-not (Test-Path -LiteralPath $DriverPath)) {
+            $MissingDriverFiles += $DriverFile
+        }
+    }
+
+    if ($MissingDriverFiles.Count -eq 0) {
+
+        Add-HealthResult `
+            -Status "PASS" `
+            -Category "Drivers" `
+            -Check "FSLogix minifilter driver files" `
+            -Finding "All expected FSLogix minifilter driver files are installed." `
+            -Evidence ($DriverFiles -join "; ")
+    }
+    else {
+
+        Add-HealthResult `
+            -Status "FAIL" `
+            -Category "Drivers" `
+            -Check "FSLogix minifilter driver files" `
+            -Finding "$($MissingDriverFiles.Count) expected FSLogix driver file(s) are missing." `
+            -Evidence ($MissingDriverFiles -join "; ") `
+            -Recommendation "Repair or reinstall FSLogix Apps."
+    }
+
+    try {
+
+        $FltmcOutput = @(
+            & fltmc.exe filters 2>&1
+        )
+
+        $LoadedFilters = @()
+
+        foreach ($Line in $FltmcOutput) {
+
+            if ($Line -match '^\s*(frxdrv|frxdrvvt|frxccd)\s+') {
+                $LoadedFilters += $Matches[1].ToLowerInvariant()
+            }
+        }
+
+        $LoadedFilters = @(
+            $LoadedFilters |
+            Select-Object -Unique
+        )
+
+        foreach ($RequiredFilter in @(
+            "frxdrv",
+            "frxdrvvt",
+            "frxccd"
+        )) {
+
+            if ($LoadedFilters -contains $RequiredFilter) {
+
+                Add-HealthResult `
+                    -Status "PASS" `
+                    -Category "Drivers" `
+                    -Check "$RequiredFilter minifilter" `
+                    -Finding "$RequiredFilter is loaded."
+            }
+            else {
+
+                Add-HealthResult `
+                    -Status "FAIL" `
+                    -Category "Drivers" `
+                    -Check "$RequiredFilter minifilter" `
+                    -Finding "$RequiredFilter is not currently loaded." `
+                    -Recommendation "Review the FSLogix installation and service/driver state."
+            }
+        }
+    }
+    catch {
+
+        Add-HealthResult `
+            -Status "INFO" `
+            -Category "Drivers" `
+            -Check "FSLogix minifilter state" `
+            -Finding "Unable to query loaded minifilter drivers." `
+            -Evidence $_.Exception.Message
+    }
+}
+else {
+
+    Add-HealthResult `
+        -Status "INFO" `
+        -Category "Drivers" `
+        -Check "FSLogix minifilter drivers" `
+        -Finding "Driver checks were skipped because FSLogix is not installed."
+}
+
+# ------------------------------------------------------------
+# FSLogix local include/exclude groups
+# ------------------------------------------------------------
+
+if ($FSLogixInstalled) {
+
+    $FSLogixGroups = @(
+        "FSLogix Profile Include List",
+        "FSLogix Profile Exclude List",
+        "FSLogix ODFC Include List",
+        "FSLogix ODFC Exclude List"
+    )
+
+    $ExistingGroups = @()
+    $MissingGroups  = @()
+
+    foreach ($GroupName in $FSLogixGroups) {
+
+        try {
+
+            $GroupExists = $false
+
+            try {
+
+                $null = Get-LocalGroup `
+                    -Name $GroupName `
+                    -ErrorAction Stop
+
+                $GroupExists = $true
+            }
+            catch {
+
+                try {
+
+                    $null = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+                    $GroupExists = $true
+                }
+                catch {
+                    $GroupExists = $false
+                }
+            }
+
+            if ($GroupExists) {
+                $ExistingGroups += $GroupName
+            }
+            else {
+                $MissingGroups += $GroupName
+            }
+        }
+        catch {
+            $MissingGroups += $GroupName
+        }
+    }
+
+    if ($MissingGroups.Count -eq 0) {
+
+        Add-HealthResult `
+            -Status "PASS" `
+            -Category "Groups" `
+            -Check "FSLogix local groups" `
+            -Finding "All four expected FSLogix local groups are present." `
+            -Evidence ($FSLogixGroups -join "; ")
+    }
+    else {
+
+        Add-HealthResult `
+            -Status "FAIL" `
+            -Category "Groups" `
+            -Check "FSLogix local groups" `
+            -Finding "$($MissingGroups.Count) expected FSLogix local group(s) are missing." `
+            -Evidence ($MissingGroups -join "; ") `
+            -Recommendation "Review or repair the FSLogix installation."
+    }
+
+    foreach ($IncludeGroup in @(
+        "FSLogix Profile Include List",
+        "FSLogix ODFC Include List"
+    )) {
+
+        if ($ExistingGroups -contains $IncludeGroup) {
+
+            try {
+
+                $Members = @(
+                    Get-LocalGroupMemberNames `
+                        -GroupName $IncludeGroup
+                )
+
+                if ($Members.Count -eq 0) {
+
+                    Add-HealthResult `
+                        -Status "WARN" `
+                        -Category "Groups" `
+                        -Check $IncludeGroup `
+                        -Finding "The include group has no members." `
+                        -Recommendation "Confirm that this is intentional because no users will be included through this group."
+                }
+                elseif (Test-EveryoneMembership -Members $Members) {
+
+                    Add-HealthResult `
+                        -Status "PASS" `
+                        -Category "Groups" `
+                        -Check $IncludeGroup `
+                        -Finding "The include group contains Everyone." `
+                        -Evidence ($Members -join "; ")
+                }
+                else {
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Groups" `
+                        -Check $IncludeGroup `
+                        -Finding "The include group uses custom membership rather than Everyone." `
+                        -Evidence ($Members -join "; ") `
+                        -Recommendation "Confirm that the scoped membership is intentional."
+                }
+            }
+            catch {
+
+                Add-HealthResult `
+                    -Status "INFO" `
+                    -Category "Groups" `
+                    -Check $IncludeGroup `
+                    -Finding "Unable to enumerate group membership." `
+                    -Evidence $_.Exception.Message
+            }
+        }
+    }
+
+    foreach ($ExcludeGroup in @(
+        "FSLogix Profile Exclude List",
+        "FSLogix ODFC Exclude List"
+    )) {
+
+        if ($ExistingGroups -contains $ExcludeGroup) {
+
+            try {
+
+                $Members = @(
+                    Get-LocalGroupMemberNames `
+                        -GroupName $ExcludeGroup
+                )
+
+                if ($Members.Count -eq 0) {
+
+                    Add-HealthResult `
+                        -Status "PASS" `
+                        -Category "Groups" `
+                        -Check $ExcludeGroup `
+                        -Finding "The exclude group has no members."
+                }
+                else {
+
+                    Add-HealthResult `
+                        -Status "INFO" `
+                        -Category "Groups" `
+                        -Check $ExcludeGroup `
+                        -Finding "$($Members.Count) member(s) are explicitly excluded from FSLogix processing." `
+                        -Evidence ($Members -join "; ") `
+                        -Recommendation "Confirm that the exclusions are intentional."
+                }
+            }
+            catch {
+
+                Add-HealthResult `
+                    -Status "INFO" `
+                    -Category "Groups" `
+                    -Check $ExcludeGroup `
+                    -Finding "Unable to enumerate group membership." `
+                    -Evidence $_.Exception.Message
+            }
+        }
+    }
+}
+else {
+
+    Add-HealthResult `
+        -Status "INFO" `
+        -Category "Groups" `
+        -Check "FSLogix local groups" `
+        -Finding "Local group checks were skipped because FSLogix is not installed."
 }
 
 # ------------------------------------------------------------
@@ -761,6 +1279,7 @@ if ($FSLogixInstalled) {
                     -RequiredProcess $RequiredProcess `
                     -ConfiguredProcesses $ExclusionProcesses
             )) {
+
                 $MissingExclusions.Add(
                     "Process: $RequiredProcess"
                 )
@@ -778,6 +1297,7 @@ if ($FSLogixInstalled) {
                     -RequiredPath $RequiredPath `
                     -ConfiguredPaths $ExclusionPaths
             )) {
+
                 $MissingExclusions.Add(
                     "Path: $RequiredPath"
                 )
@@ -795,6 +1315,7 @@ if ($FSLogixInstalled) {
                     -RequiredPath $Driver `
                     -ConfiguredPaths $ExclusionPaths
             )) {
+
                 $MissingExclusions.Add(
                     "Driver: $Driver"
                 )
@@ -827,6 +1348,7 @@ if ($FSLogixInstalled) {
                 ) -contains $RequiredExtension
 
                 if (-not $ExtensionCovered) {
+
                     $MissingExclusions.Add(
                         "Temporary VHD path: $RequiredTempPath"
                     )
@@ -842,6 +1364,7 @@ if ($FSLogixInstalled) {
                     -ConfiguredPaths $ExclusionPaths `
                     -ConfiguredExtensions $ExclusionExtensions
             )) {
+
                 $MissingExclusions.Add(
                     "Profile share: $Location"
                 )
@@ -946,7 +1469,7 @@ if ($FSLogixInstalled) {
 
             foreach ($Group in $Groups) {
 
-                $First = $Group.Group[0]
+                $First          = $Group.Group[0]
                 $Classification = $First.Classification
 
                 $Samples = @(
@@ -964,6 +1487,7 @@ if ($FSLogixInstalled) {
                         ).Trim()
 
                         if ($CleanMessage.Length -gt 350) {
+
                             $CleanMessage =
                                 $CleanMessage.Substring(0,350) + "..."
                         }
@@ -1017,7 +1541,9 @@ if ($FSLogixInstalled) {
         try {
 
             $SessionKeys = @(
-                Get-ChildItem -Path $SessionRoot -ErrorAction Stop
+                Get-ChildItem `
+                    -Path $SessionRoot `
+                    -ErrorAction Stop
             )
 
             if ($SessionKeys.Count -eq 0) {
@@ -1065,7 +1591,7 @@ if ($FSLogixInstalled) {
                         -Status "PASS" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
-                        -Finding "$($SessionStates.Count) FSLogix session(s) recorded with no non-zero status values." `
+                        -Finding "FSLogix session(s) recorded with no non-zero status values." `
                         -Evidence $SessionEvidence
                 }
                 else {
@@ -1142,7 +1668,8 @@ if ($FSLogixInstalled) {
         if (Test-Path "C:\Users") {
 
             $TempFolders = @(
-                Get-ChildItem "C:\Users" `
+                Get-ChildItem `
+                    "C:\Users" `
                     -Directory `
                     -ErrorAction SilentlyContinue |
                 Where-Object {
@@ -1168,6 +1695,7 @@ if ($FSLogixInstalled) {
             $EvidenceParts = @()
 
             if ($BakKeys.Count -gt 0) {
+
                 $EvidenceParts += (
                     "ProfileList .bak keys: " +
                     (($BakKeys | ForEach-Object {
@@ -1177,6 +1705,7 @@ if ($FSLogixInstalled) {
             }
 
             if ($TempFolders.Count -gt 0) {
+
                 $EvidenceParts += (
                     "TEMP profile folders: " +
                     (($TempFolders | ForEach-Object {
@@ -1292,6 +1821,7 @@ if ($FSLogixInstalled) {
                 -ErrorAction SilentlyContinue
 
             if ($LoggingConfig.LogDir) {
+
                 $LogDir = [Environment]::ExpandEnvironmentVariables(
                     [string]$LoggingConfig.LogDir
                 )
@@ -1397,12 +1927,14 @@ $JsonFile = Join-Path `
 $JsonOutput = [PSCustomObject]@{
     ComputerName = $ComputerName
     Generated    = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Summary      = [PSCustomObject]@{
+
+    Summary = [PSCustomObject]@{
         Pass = $PassCount
         Warn = $WarnCount
         Fail = $FailCount
         Info = $InfoCount
     }
+
     Results = $Results
 }
 
@@ -1421,6 +1953,7 @@ $HtmlFile = Join-Path `
 $HtmlRows = foreach ($Result in $Results) {
 
     switch ($Result.Status) {
+
         "PASS" {
             $StatusClass = "pass"
         }
@@ -1602,6 +2135,12 @@ $Html |
 Write-Host ""
 Write-Host "FSLogix Health Audit"
 Write-Host "--------------------"
+Write-Host "Computer    : $ComputerName"
+Write-Host "PASS        : $PassCount"
+Write-Host "WARN        : $WarnCount"
+Write-Host "FAIL        : $FailCount"
+Write-Host "INFO        : $InfoCount"
+Write-Host ""
 Write-Host "JSON report : $JsonFile"
 Write-Host "HTML report : $HtmlFile"
 Write-Host ""
