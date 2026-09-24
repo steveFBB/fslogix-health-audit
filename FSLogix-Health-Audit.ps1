@@ -56,12 +56,8 @@ function Normalize-PathString {
 
     $Normalized = $Path.Trim()
 
-    # Treat a username-specific path as equivalent to a wildcard user path.
     $Normalized = $Normalized -replace '(?i)%username%', '*'
-
-    # Expand standard Windows environment variables.
     $Normalized = [Environment]::ExpandEnvironmentVariables($Normalized)
-
     $Normalized = $Normalized -replace '/', '\'
     $Normalized = $Normalized.TrimEnd('\')
 
@@ -73,8 +69,8 @@ function Test-PathCoverage {
         [Parameter(Mandatory)]
         [string]$RequiredPath,
 
-        [Parameter(Mandatory)]
-        [string[]]$ConfiguredPaths
+        [AllowEmptyCollection()]
+        [string[]]$ConfiguredPaths = @()
     )
 
     $Required = Normalize-PathString $RequiredPath
@@ -87,12 +83,10 @@ function Test-PathCoverage {
             continue
         }
 
-        # Exact match
         if ($Configured -eq $Required) {
             return $true
         }
 
-        # Wildcard coverage
         if ($Required -like $Configured) {
             return $true
         }
@@ -101,7 +95,6 @@ function Test-PathCoverage {
             return $true
         }
 
-        # Parent folder exclusion covers children
         if (
             -not $Configured.Contains("*") -and
             $Required.StartsWith(
@@ -120,8 +113,8 @@ function Test-ProcessCoverage {
         [Parameter(Mandatory)]
         [string]$RequiredProcess,
 
-        [Parameter(Mandatory)]
-        [string[]]$ConfiguredProcesses
+        [AllowEmptyCollection()]
+        [string[]]$ConfiguredProcesses = @()
     )
 
     $RequiredName = [System.IO.Path]::GetFileName(
@@ -151,16 +144,15 @@ function Test-ShareContainerCoverage {
         [Parameter(Mandatory)]
         [string]$SharePath,
 
-        [Parameter(Mandatory)]
-        [string[]]$ConfiguredPaths,
+        [AllowEmptyCollection()]
+        [string[]]$ConfiguredPaths = @(),
 
-        [Parameter(Mandatory)]
-        [string[]]$ConfiguredExtensions
+        [AllowEmptyCollection()]
+        [string[]]$ConfiguredExtensions = @()
     )
 
     $Share = (Normalize-PathString $SharePath).TrimEnd('\')
 
-    # Whole-share exclusion
     if (
         Test-PathCoverage `
             -RequiredPath $Share `
@@ -169,9 +161,9 @@ function Test-ShareContainerCoverage {
         return $true
     }
 
-    # Extension exclusions can also cover the container files.
     $Extensions = @(
         $ConfiguredExtensions |
+        Where-Object { $_ } |
         ForEach-Object {
             $_.TrimStart('.').ToLowerInvariant()
         }
@@ -184,7 +176,6 @@ function Test-ShareContainerCoverage {
         return $true
     }
 
-    # Microsoft-style individual patterns.
     $RequiredPatterns = @(
         "$Share\*\*.vhd",
         "$Share\*\*.vhd.lock",
@@ -1063,31 +1054,35 @@ if ($FSLogixInstalled) {
 
                 if ($FailedSessions.Count -eq 0) {
 
+                    $SessionEvidence = (
+                        $SessionStates |
+                        ForEach-Object {
+                            "$($_.SID): Status=$($_.Status)"
+                        }
+                    ) -join "; "
+
                     Add-HealthResult `
                         -Status "PASS" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
                         -Finding "$($SessionStates.Count) FSLogix session(s) recorded with no non-zero status values." `
-                        -Evidence (
-                            $SessionStates |
-                            ForEach-Object {
-                                "$($_.SID): Status=$($_.Status)"
-                            }
-                        ) -join "; "
+                        -Evidence $SessionEvidence
                 }
                 else {
+
+                    $SessionEvidence = (
+                        $FailedSessions |
+                        ForEach-Object {
+                            "$($_.SID): Status=$($_.Status), ErrorCode=$($_.ErrorCode), Reason=$($_.Reason)"
+                        }
+                    ) -join "; "
 
                     Add-HealthResult `
                         -Status "WARN" `
                         -Category "Runtime" `
                         -Check "Session attach status" `
                         -Finding "$($FailedSessions.Count) FSLogix session(s) have a non-zero status." `
-                        -Evidence (
-                            $FailedSessions |
-                            ForEach-Object {
-                                "$($_.SID): Status=$($_.Status), ErrorCode=$($_.ErrorCode), Reason=$($_.Reason)"
-                            }
-                        ) -join "; " `
+                        -Evidence $SessionEvidence `
                         -Recommendation "Review the affected session status against the FSLogix logs and error codes."
                 }
             }
@@ -1129,7 +1124,7 @@ if ($FSLogixInstalled) {
     $ProfileListPath =
         "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
 
-    $BakKeys = @()
+    $BakKeys     = @()
     $TempFolders = @()
 
     try {
@@ -1251,8 +1246,6 @@ if ($FSLogixInstalled) {
                 }
             ) -join "; "
 
-            # Deliberately INFO rather than WARN.
-            # Admin/service profiles can legitimately exist on an AVD host.
             Add-HealthResult `
                 -Status "INFO" `
                 -Category "Runtime" `
@@ -1290,7 +1283,7 @@ if ($FSLogixInstalled) {
     try {
 
         $LoggingRegPath = "HKLM:\SOFTWARE\FSLogix\Logging"
-        $LogDir = "C:\ProgramData\FSLogix\Logs"
+        $LogDir         = "C:\ProgramData\FSLogix\Logs"
 
         if (Test-Path $LoggingRegPath) {
 
@@ -1327,7 +1320,7 @@ if ($FSLogixInstalled) {
                     -Category "Runtime" `
                     -Check "FSLogix text logging" `
                     -Finding "FSLogix text logging is active." `
-                    -Evidence "$RecentLogs.Count log file(s) updated within the last $EventLookbackDays days. Log directory: $LogDir"
+                    -Evidence "$($RecentLogs.Count) log file(s) updated within the last $EventLookbackDays days. Log directory: $LogDir"
             }
             else {
 
